@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Generated data (rebuilt via pipeline / GDrive sync)
+processed/
+labels_yolo/
+yolo_dataset/
+gdrive_cache/
+runs/
+model_checkpoints/
+
+# Large raw dataset (too big for git; sync from Drive or train.zip)
+train/
+labels/
+
+# Secrets / OAuth
+credentials.json
+settings.yaml
+*.pickle
+token.json
+
+# Logs / local training test noise
+*.log
+space_debris/training_test.log
+space_debris/training_test.txt
