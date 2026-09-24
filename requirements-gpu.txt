@@ -1,0 +1,9 @@
+# GPU / JarvisLabs requirements
+# Do NOT pin torch/torchvision — the pytorch template provides CUDA builds.
+ultralytics==8.4.161
+opencv-python-headless==5.0.0.93
+pandas==3.0.6
+tqdm==4.70.1
+matplotlib==3.11.2
+pillow==12.3.0
+pyyaml>=6.0
