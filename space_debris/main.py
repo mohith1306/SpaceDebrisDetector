@@ -11,6 +11,11 @@ Usage:
     python -m space_debris.main train --resume
     python -m space_debris.main train_resilient  # P1/P2 model with logging & recovery
     python -m space_debris.main predict
+    python -m space_debris.main track           # detect + multi-object tracking
+    python -m space_debris.main stream          # detect + track + classify + orbit
+    python -m space_debris.main orbit           # orbit report from a track JSONL
+    python -m space_debris.main build_crops     # crop dataset for 2nd-stage classifier
+    python -m space_debris.main train_classifier
     python -m space_debris.main logs            # View training logs
 """
 import argparse
@@ -87,6 +92,63 @@ def main():
     pred_parser.add_argument("--device", default=DEVICE)
     pred_parser.add_argument("--visualize", action="store_true", help="Show predictions")
 
+    # Track (detection + multi-object tracking)
+    track_parser = subparsers.add_parser("track", help="Detect + track objects across frames")
+    track_parser.add_argument("--model", help="Model path (default: latest run)")
+    track_parser.add_argument("--source", help="Video file, image dir, or camera index (default: val images)")
+    track_parser.add_argument("--conf", type=float, default=0.25)
+    track_parser.add_argument("--device", default=DEVICE)
+    track_parser.add_argument("--tracker", default="bytetrack.yaml", help="Tracker yaml (bytetrack/botsort)")
+    track_parser.add_argument("--imgsz", type=int, default=640)
+    track_parser.add_argument("--max-frames", type=int, help="Stop after N frames")
+    track_parser.add_argument("--fps", type=float, help="Assumed frame rate for image sequences")
+    track_parser.add_argument("--out", help="Write per-frame JSONL to this path")
+    track_parser.add_argument("--save", action="store_true", help="Save annotated result via ultralytics")
+
+    # Stream (full pipeline: detect -> track -> classify -> orbit)
+    stream_parser = subparsers.add_parser("stream", help="Streaming pipeline: detect + track + classify + orbit")
+    stream_parser.add_argument("--model", help="Model path (default: latest run)")
+    stream_parser.add_argument("--source", help="Video file, image dir, or camera index")
+    stream_parser.add_argument("--conf", type=float, default=0.25)
+    stream_parser.add_argument("--device", default=DEVICE)
+    stream_parser.add_argument("--imgsz", type=int, default=640)
+    stream_parser.add_argument("--tracker", default="bytetrack.yaml", help="Tracker yaml; empty disables tracking")
+    stream_parser.add_argument("--no-tracker", action="store_true", help="Disable cross-frame association")
+    stream_parser.add_argument("--classifier", help="2nd-stage classifier weights (e.g. model_checkpoints/classifier/weights/best.pt)")
+    stream_parser.add_argument("--no-orbit", action="store_true", help="Disable per-track orbit estimation")
+    stream_parser.add_argument("--fov", type=float, default=60.0, help="Camera horizontal FOV (deg)")
+    stream_parser.add_argument("--range-km", type=float, help="Observer-to-object range; enables physical speed/orbit checks")
+    stream_parser.add_argument("--fps", type=float, help="Assumed frame rate for image sequences")
+    stream_parser.add_argument("--out", help="Write per-frame JSONL")
+    stream_parser.add_argument("--annotate", help="Write annotated video (e.g. runs/stream.mp4)")
+    stream_parser.add_argument("--orbit-report", help="Write per-track orbit JSON")
+    stream_parser.add_argument("--max-frames", type=int, help="Stop after N frames")
+    stream_parser.add_argument("--save", action="store_true")
+
+    # Orbit (offline stage over a JSONL from `track`)
+    orbit_parser = subparsers.add_parser("orbit", help="Orbit/trajectory report from a track JSONL")
+    orbit_parser.add_argument("--jsonl", required=True, help="JSONL written by `track --out`")
+    orbit_parser.add_argument("--fov", type=float, default=60.0, help="Camera horizontal FOV (deg)")
+    orbit_parser.add_argument("--range-km", type=float, help="Observer-to-object range (km)")
+    orbit_parser.add_argument("--width", type=int, help="Image width (auto-detected from record sources)")
+    orbit_parser.add_argument("--height", type=int, help="Image height (auto-detected from record sources)")
+    orbit_parser.add_argument("--out", help="Write orbit report JSON")
+
+    # Second-stage classifier
+    crops_parser = subparsers.add_parser("build_crops", help="Build crop dataset for the 2nd-stage classifier")
+    crops_parser.add_argument("--val-ratio", type=float, default=0.2)
+    crops_parser.add_argument("--pad", type=float, default=0.10, help="Crop padding fraction")
+    crops_parser.add_argument("--out", help="Output dir (default: model_checkpoints/crops)")
+
+    cls_parser = subparsers.add_parser("train_classifier", help="Train 2nd-stage classifier on crops")
+    cls_parser.add_argument("--epochs", type=int, default=10)
+    cls_parser.add_argument("--imgsz", type=int, default=224)
+    cls_parser.add_argument("--batch", type=int, default=64)
+    cls_parser.add_argument("--model", default="yolo11n-cls.pt")
+    cls_parser.add_argument("--workers", type=int, default=4)
+    cls_parser.add_argument("--device", default=DEVICE)
+    cls_parser.add_argument("--data", help="Crop dataset dir (default: model_checkpoints/crops)")
+
     # View logs
     log_parser = subparsers.add_parser("logs", help="View training logs")
     log_parser.add_argument("--session", help="Session ID (default: latest)")
@@ -140,6 +202,71 @@ def main():
         results = predict(model_path=args.model, source=args.source, conf=args.conf, device=args.device)
         if args.visualize:
             visualize_predictions()
+
+    elif args.command == "track":
+        import json as _json
+        from space_debris.models.track import track as run_track
+        summary = run_track(
+            model_path=args.model, source=args.source, conf=args.conf,
+            device=args.device, tracker=args.tracker, imgsz=args.imgsz,
+            max_frames=args.max_frames, fps=args.fps, out_jsonl=args.out,
+            save=args.save,
+        )
+        print(_json.dumps(summary, indent=2))
+
+    elif args.command == "stream":
+        import json as _json
+        from space_debris.models.stream import run_stream
+        summary = run_stream(
+            model_path=args.model, source=args.source, conf=args.conf,
+            device=args.device, imgsz=args.imgsz,
+            tracker=(None if (args.no_tracker or not args.tracker) else args.tracker),
+            classifier_path=args.classifier,
+            orbit=not args.no_orbit, fov_deg=args.fov, range_km=args.range_km,
+            fps=args.fps, out_jsonl=args.out, annotate_path=args.annotate,
+            orbit_report_path=args.orbit_report, max_frames=args.max_frames,
+            save=args.save,
+        )
+        print(_json.dumps(summary, indent=2))
+
+    elif args.command == "orbit":
+        import json as _json
+        from space_debris.utils.orbit import orbit_from_jsonl
+        result = orbit_from_jsonl(
+            args.jsonl, fov_deg=args.fov, range_km=args.range_km,
+            width=args.width, height=args.height, out_json=args.out,
+        )
+        report = result.pop("report")
+        print(_json.dumps(result, indent=2))
+        for entry in report[:10]:
+            traj = entry["trajectory"]
+            rate = traj.get("angular_rate_deg_s")
+            speed = traj.get("speed_km_s")
+            print(f"  track #{entry['track_id']}: {traj['n_points']} pts, "
+                  f"{traj.get('duration_s')}s, angular rate="
+                  f"{None if rate is None else [round(v, 5) for v in rate]} deg/s, "
+                  f"speed={speed} km/s")
+        if len(report) > 10:
+            print(f"  ... {len(report) - 10} more tracks")
+
+    elif args.command == "build_crops":
+        import json as _json
+        from space_debris.models.classify import build_crop_dataset
+        from pathlib import Path as _Path
+        summary = build_crop_dataset(
+            val_ratio=args.val_ratio, pad_frac=args.pad,
+            out_dir=_Path(args.out) if args.out else None,
+        )
+        print(_json.dumps(summary, indent=2))
+
+    elif args.command == "train_classifier":
+        from space_debris.models.classify import train_classifier
+        best = train_classifier(
+            epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
+            model=args.model, workers=args.workers, device=args.device,
+            data=args.data,
+        )
+        print(f"✅ classifier weights: {best}")
 
     elif args.command == "logs":
         from space_debris.config import RUNS_DIR

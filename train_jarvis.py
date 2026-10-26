@@ -82,7 +82,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", default="0", help="CUDA device index or 'cpu'")
     p.add_argument("--model-size", default="n", choices=["n", "s", "m", "l", "x"])
-    p.add_argument("--arch", default="p1p2", choices=["standard", "p1p2"])
+    p.add_argument("--arch", default="p1p2", choices=["standard", "p1p2", "yolo11"])
     p.add_argument("--resume", action="store_true")
     p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--skip-rebuild", action="store_true", help="Assume yolo_dataset already built")

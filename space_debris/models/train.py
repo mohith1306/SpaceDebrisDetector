@@ -3,10 +3,10 @@ from pathlib import Path
 import torch
 from ultralytics import YOLO
 
-from ..config import CHECKPOINT_DIR, YOLO_BASE, RUNS_DIR, DEVICE
+from ..config import CHECKPOINT_DIR, YOLO_BASE, RUNS_DIR, DEVICE, NUM_CLASSES, get_yaml_config
 
 VALID_MODEL_SIZES = ["n", "s", "m", "l", "x"]
-VALID_ARCHITECTURES = ["standard", "p1p2"]
+VALID_ARCHITECTURES = ["standard", "p1p2", "yolo11"]
 
 def get_latest_checkpoint():
     weights_dir = RUNS_DIR / "detect" / "weights"
@@ -33,15 +33,8 @@ def train(epochs=30, imgsz=640, batch=4, device=None, resume=False, workers=0, m
         )
     print(f"Training on device: {device}")
     yaml_path = YOLO_BASE / "space_debris.yaml"
-    yaml_content = f"""path: {YOLO_BASE}
-train: images/train
-val: images/val
-
-nc: 1
-names: ['space_object']
-"""
-    yaml_path.write_text(yaml_content)
-    print(f"Dataset config saved to: {yaml_path}")
+    yaml_path.write_text(get_yaml_config())
+    print(f"Dataset config saved to: {yaml_path} (nc={NUM_CLASSES})")
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,7 +45,11 @@ names: ['space_object']
             print(f"Resuming from: {checkpoint}")
             model = YOLO(checkpoint)
         else:
-            if arch == "p1p2":
+            if arch == "yolo11":
+                base_model = f"yolo11{model_size}.pt"
+                print(f"No checkpoint found, starting fresh with {base_model}")
+                model = YOLO(base_model)
+            elif arch == "p1p2":
                 model_yaml = Path(__file__).parent / "yolov8_p1p2.yaml"
                 if model_yaml.exists():
                     print(f"No checkpoint found, starting fresh with P1/P2 architecture")
@@ -66,7 +63,11 @@ names: ['space_object']
                 print(f"No checkpoint found, starting fresh with {base_model}")
                 model = YOLO(base_model)
     else:
-        if arch == "p1p2":
+        if arch == "yolo11":
+            base_model = f"yolo11{model_size}.pt"
+            print(f"Starting training with {base_model}")
+            model = YOLO(base_model)
+        elif arch == "p1p2":
             model_yaml = Path(__file__).parent / "yolov8_p1p2.yaml"
             if model_yaml.exists():
                 print(f"Starting training with P1/P2 architecture")

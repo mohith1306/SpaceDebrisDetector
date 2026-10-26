@@ -8,10 +8,13 @@ from datetime import datetime
 from ultralytics import YOLO
 import torch
 
-from ..config import CHECKPOINT_DIR, YOLO_BASE, RUNS_DIR, DEVICE
+# oneDNN (mkldnn) SIGFPEs on virtualized CPUs (JarvisLabs VMs); CUDA training unaffected.
+torch.backends.mkldnn.enabled = False
+
+from ..config import CHECKPOINT_DIR, YOLO_BASE, RUNS_DIR, DEVICE, NUM_CLASSES, get_yaml_config
 
 VALID_MODEL_SIZES = ["n", "s", "m", "l", "x"]
-VALID_ARCHITECTURES = ["standard", "p1p2"]
+VALID_ARCHITECTURES = ["standard", "p1p2", "yolo11"]
 
 LOGS_DIR = RUNS_DIR / "training_logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,7 +28,7 @@ class TrainingLogger:
         self.log_file = self.log_dir / "training.log"
         self.metrics_file = self.log_dir / "metrics.jsonl"
         self.error_file = self.log_dir / "errors.log"
-        
+
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] [{level}] {message}"
@@ -33,13 +36,13 @@ class TrainingLogger:
         with open(self.log_file, "a") as f:
             f.write(line + "\n")
             f.flush()
-            
+
     def log_metrics(self, epoch, metrics):
         entry = {"epoch": epoch, "timestamp": datetime.now().isoformat(), **metrics}
         with open(self.metrics_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
             f.flush()
-            
+
     def log_error(self, epoch, error, traceback_str):
         entry = {
             "epoch": epoch,
@@ -64,6 +67,10 @@ def get_latest_checkpoint(runs_dir):
 
 def create_custom_model(model_size="n", arch="p1p2"):
     """Create YOLO model with chosen architecture, falling back to standard on failure."""
+    if arch == "yolo11":
+        weights = f"yolo11{model_size}.pt"
+        print(f"Loading COCO-pretrained {weights}")
+        return YOLO(weights)
     if arch == "p1p2":
         model_yaml = Path(__file__).parent / "yolov8_p1p2.yaml"
         if model_yaml.exists():
@@ -99,7 +106,8 @@ def detect_device(requested_device=None):
                 return "cpu", "CPU (CUDA unavailable)"
         elif dev == "mps":
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps", "Apple Silicon GPU (MPS)"
+                name = "Apple Silicon GPU (MPS)"
+                return "mps", name
             else:
                 print("WARNING: MPS requested but not available, falling back to CPU")
                 return "cpu", "CPU (MPS unavailable)"
@@ -115,6 +123,20 @@ def detect_device(requested_device=None):
     return "cpu", "CPU"
 
 
+def extract_metrics(results):
+    """Best-effort metric dict from an ultralytics results object."""
+    metrics = {}
+    if results is None:
+        return metrics
+    for attr in ("results_dict", "metrics", "loss", "results"):
+        val = getattr(results, attr, None)
+        if isinstance(val, dict) and val:
+            return val
+        if isinstance(val, (int, float)):
+            metrics[attr] = val
+    return metrics
+
+
 def train_with_recovery(
     epochs=30,
     imgsz=640,
@@ -126,183 +148,139 @@ def train_with_recovery(
     model_size="n",
     arch="p1p2"
 ):
+    """One continuous ultralytics run with weight-carry crash recovery.
+
+    The old design called model.train(epochs=N, resume=True) once per outer
+    epoch. ultralytics strips optimizer state from best.pt/last.pt in
+    final_eval(), so resume always failed, each call trained N fresh epochs
+    from scratch counter (1+2+3+... = quadratic blowup), and the LR schedule
+    restarted every call. This version makes a single train() call for all
+    remaining epochs; on crash it reloads the newest checkpoint (weights)
+    and continues with the remaining count.
+    """
     device, device_info = detect_device(device)
-    
+
     logger = TrainingLogger()
     logger.log(f"Device detected: {device_info}")
     logger.log(f"Starting training on device: {device}")
-    logger.log(f"Epochs: {epochs}, Image size: {imgsz}, Batch: {batch}")
+    logger.log(f"Epochs: {epochs}, Image size: {imgsz}, Batch: {batch}, Resume weights: {resume}")
     logger.log(f"Logs saved to: {logger.log_dir}")
-    
-    yaml_path = YOLO_BASE / "space_debris.yaml"
-    yaml_content = f"""path: {YOLO_BASE}
-train: images/train
-val: images/val
 
-nc: 1
-names: ['space_object']
-"""
-    yaml_path.write_text(yaml_content)
-    logger.log(f"Dataset config: {yaml_path}")
-    
+    yaml_path = YOLO_BASE / "space_debris.yaml"
+    yaml_path.write_text(get_yaml_config())
+    logger.log(f"Dataset config: {yaml_path} (nc={NUM_CLASSES})")
+
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Load model
-    if resume:
-        checkpoint = get_latest_checkpoint(RUNS_DIR)
-        if checkpoint:
-            logger.log(f"Resuming from: {checkpoint}")
-            model = YOLO(checkpoint)
-        else:
-            logger.log(f"No checkpoint found, starting fresh (arch: {arch}, size: {model_size})")
-            model = create_custom_model(model_size, arch)
+
+    checkpoint = get_latest_checkpoint(RUNS_DIR) if resume else None
+    if checkpoint:
+        logger.log(f"Loading weights from: {checkpoint}")
+        model = YOLO(checkpoint)
     else:
         logger.log(f"Starting fresh (arch: {arch}, size: {model_size})")
         model = create_custom_model(model_size, arch)
-    
-    # Training loop with error recovery
-    completed_epochs = 0
-    start_epoch = 0
-    
-    if resume and checkpoint:
-        # Determine completed epochs from saved epoch checkpoints
-        epoch_checkpoints = list(CHECKPOINT_DIR.glob("epoch_*.pt"))
-        if epoch_checkpoints:
-            completed = []
-            for ckpt in epoch_checkpoints:
-                try:
-                    epoch_num = int(ckpt.stem.split("_")[1])
-                    completed.append(epoch_num)
-                except (IndexError, ValueError):
-                    pass
-            if completed:
-                start_epoch = max(completed)
-                completed_epochs = start_epoch
-                logger.log(f"Resuming from epoch {start_epoch + 1} (found {len(completed)} completed epoch checkpoints)")
-    
-    for epoch in range(start_epoch, epochs):
-        epoch_num = epoch + 1
-        logger.log(f"\n{'='*60}")
-        logger.log(f"Starting epoch {epoch_num}/{epochs}")
-        logger.log(f"{'='*60}")
-        
-        epoch_start = time.time()
-        retry_count = 0
-        epoch_success = False
-        
-        while retry_count <= max_retries and not epoch_success:
-            try:
-                if retry_count > 0:
-                    logger.log(f"Retry {retry_count}/{max_retries} for epoch {epoch_num}", "WARNING")
-                
-                # Train single epoch
-                results = model.train(
-                    data=str(yaml_path),
-                    epochs=epoch_num,  # Train up to this epoch
-                    imgsz=imgsz,
-                    batch=batch,
-                    workers=workers,
-                    device=device,
-                    resume=True,  # Resume from last checkpoint
-                    save=True,
-                    save_period=1,
-                    val=False,  # Skip validation — torchvision NMS has CUDA backend errors
-                    project=str(RUNS_DIR),
-                    name="detect",
-                    patience=epochs,  # Disable early stopping
-                    verbose=True,
-                    exist_ok=True,
-                )
-                
-                epoch_time = time.time() - epoch_start
-                completed_epochs = epoch_num
-                epoch_success = True
-                
-                # Extract metrics - try multiple attribute names
-                metrics = {}
-                if results is not None:
-                    # Try common attribute names for metrics
-                    for attr in ['results_dict', 'metrics', 'loss', 'results']:
-                        if hasattr(results, attr):
-                            val = getattr(results, attr)
-                            if isinstance(val, dict):
-                                metrics = val
-                                break
-                            elif isinstance(val, (int, float)):
-                                metrics = {attr: val}
-                                break
-                
-                # Log metrics to JSONL file (may be empty if results None)
-                try:
-                    logger.log_metrics(epoch_num, {
-                        "epoch_time_sec": epoch_time,
-                        "metrics": metrics
-                    })
-                except Exception:
-                    pass
-                
-                # Write epoch progress summary to training log file
-                logger.log(f"\nEpoch {epoch_num}/{epochs} completed in {epoch_time:.1f}s")
-                
-                if metrics:
-                    metric_parts = []
-                    for k, v in metrics.items():
-                        if isinstance(v, (int, float)):
-                            metric_parts.append(f"{k}:{v:.4f}" if isinstance(v, float) else f"{k}:{v}")
-                    metric_str = " | ".join(metric_parts[:4])
-                    logger.log(f"Metrics: {metric_str}")
-                else:
-                    logger.log("Metrics: None available")
-                
-                # Also print to console for real-time monitoring
-                if metrics:
-                    for k, v in metrics.items():
-                        if isinstance(v, (int, float)):
-                            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}", end="  |  ")
-                    print()
-                else:
-                    print(f"  Epoch {epoch_num} completed in {epoch_time:.1f}s (no metrics)")
-                
-            except Exception as e:
-                retry_count += 1
-                tb_str = traceback.format_exc()
-                logger.log_error(epoch_num, e, tb_str)
-                logger.log(f"Epoch {epoch_num} failed (attempt {retry_count}): {e}", "ERROR")
-                
-                if retry_count > max_retries:
-                    logger.log(f"Max retries reached for epoch {epoch_num}. Skipping...", "ERROR")
+
+    state = {"done": 0, "base": 0, "last_t": time.time()}
+
+    def on_fit_epoch_end(*args, **kwargs):
+        trainer = None
+        for a in args:
+            if hasattr(a, "epoch"):
+                trainer = a
+                break
+        if trainer is None:
+            return
+        try:
+            now = time.time()
+            m = {}
+            for attr in ("metrics", "results_dict", "results"):
+                v = getattr(trainer, attr, None)
+                if isinstance(v, dict) and v:
+                    m = v
                     break
-                
-                # Wait before retry
-                wait_time = min(30 * retry_count, 300)
-                logger.log(f"Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
-                
-                # Try to reload model from last checkpoint
-                try:
-                    latest = get_latest_checkpoint(RUNS_DIR)
-                    if latest:
-                        logger.log(f"Reloading model from: {latest}")
-                        model = YOLO(latest)
-                except Exception as reload_e:
-                    logger.log(f"Failed to reload model: {reload_e}", "ERROR")
-        
-        # Save progress checkpoint after each epoch
-        if epoch_success:
+                rd = getattr(v, "results_dict", None) if v is not None else None
+                if isinstance(rd, dict) and rd:
+                    m = rd
+                    break
+            state["done"] = state["base"] + int(trainer.epoch) + 1
+            logger.log_metrics(state["done"], {
+                "epoch_time_sec": now - state["last_t"],
+                "metrics": m,
+            })
+            state["last_t"] = now
+            shown = ", ".join(
+                f"{k}={v:.4f}" for k, v in list(m.items())[:4] if isinstance(v, float)
+            )
+            logger.log(f"Epoch {state['done']}/{epochs} completed ({shown})")
+        except Exception:
+            pass
+
+    model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+
+    results = None
+    attempts = 0
+    while True:
+        remaining = epochs - state["done"]
+        if remaining <= 0:
+            break
+        state["base"] = state["done"]
+        state["last_t"] = time.time()
+        try:
+            logger.log(f"Training {remaining} epoch(s) ({state['done']}/{epochs} done)")
+            results = model.train(
+                data=str(yaml_path),
+                epochs=remaining,
+                imgsz=imgsz,
+                batch=batch,
+                workers=workers,
+                device=device,
+                resume=False,
+                save=True,
+                save_period=1,
+                val=True,
+                project=str(RUNS_DIR),
+                name="detect",
+                patience=epochs,
+                verbose=True,
+                exist_ok=True,
+            )
+            state["done"] = epochs
+            break
+        except Exception as e:
+            attempts += 1
+            tb_str = traceback.format_exc()
+            logger.log_error(state["done"], e, tb_str)
+            logger.log(
+                f"Training interrupted after {state['done']} epochs (attempt {attempts}): {e}",
+                "ERROR",
+            )
+            if attempts > max_retries:
+                logger.log("Max retries reached. Giving up.", "ERROR")
+                break
+            wait_time = min(30 * attempts, 300)
+            logger.log(f"Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
             latest = get_latest_checkpoint(RUNS_DIR)
             if latest:
-                import shutil
-                progress_ckpt = CHECKPOINT_DIR / f"epoch_{epoch_num}.pt"
-                shutil.copy2(latest, progress_ckpt)
-                logger.log(f"Saved epoch checkpoint: {progress_ckpt}")
-    
-    logger.log(f"\nTraining finished. Completed {completed_epochs}/{epochs} epochs.")
+                logger.log(f"Reloading model from: {latest}")
+                model = YOLO(latest)
+                model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+
+    if results is not None:
+        final = extract_metrics(results)
+        if final:
+            shown = ", ".join(
+                f"{k}={v:.4f}" for k, v in final.items() if isinstance(v, float)
+            )
+            logger.log(f"Final metrics: {shown}")
+
+    logger.log(f"\nTraining finished. {state['done']}/{epochs} epochs completed.")
     logger.log(f"Best model: {RUNS_DIR}/detect/weights/best.pt")
     logger.log(f"Last checkpoint: {RUNS_DIR}/detect/weights/last.pt")
     logger.log(f"Logs: {logger.log_dir}")
-    
-    return completed_epochs
+
+    return state["done"]
 
 
 if __name__ == "__main__":

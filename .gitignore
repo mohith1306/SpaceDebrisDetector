@@ -14,12 +14,29 @@ model_checkpoints/
 # Large raw dataset (too big for git; sync from Drive or train.zip)
 train/
 labels/
+train.csv
+val.csv
+
+# Downloaded training artifacts (weights, plots, logs)
+results/
+*.pt
+*.onnx
+*.engine
+*.torchscript
+
+# Generated tracking and demo outputs
+*.jsonl
+*.mp4
+*.avi
+*.mov
 
 # Secrets / OAuth
 credentials.json
 settings.yaml
 *.pickle
 token.json
+.env
+.env.*
 
 # Logs / local training test noise
 *.log

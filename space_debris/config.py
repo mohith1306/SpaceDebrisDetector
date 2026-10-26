@@ -34,8 +34,43 @@ RUNS_DIR = BASE_DIR / "runs"
 IMAGE_DIR = DATA_DIR / "train"
 LABEL_CSV = LABELS_DIR / "train.csv"
 
-NUM_CLASSES = 1
-CLASS_NAMES = ["space_object"]
+# ---------------------------------------------------------------------------
+# Class taxonomy (11 raw classes present in labels/train.csv `class` column).
+# Order is fixed here: convert_labels.py writes these ids into the YOLO label
+# files and get_yaml_config() writes the same order into space_debris.yaml.
+# Never reorder -- that would silently relabel the training data.
+# ---------------------------------------------------------------------------
+CLASS_NAMES = [
+    "cheops",
+    "debris",
+    "double_star",
+    "earth_observation_sat_1",
+    "lisa_pathfinder",
+    "proba_2",
+    "proba_3_csc",
+    "proba_3_ocs",
+    "smart_1",
+    "soho",
+    "xmm_newton",
+]
+NUM_CLASSES = len(CLASS_NAMES)
+CLASS_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
+
+# Classes that are debris rather than an intact spacecraft: used by the
+# detection -> classification stage to answer "is this debris?" directly.
+DEBRIS_CLASSES = ["debris"]
+LEGACY_COLLAPSE_TO_SINGLE_CLASS = False  # True reproduces the old nc:1 labels
+
+
+def class_id(name: str) -> int:
+    """Map a raw CSV class name to its YOLO class id (raises on unknown)."""
+    try:
+        return CLASS_TO_ID[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown class {name!r}; expected one of {sorted(CLASS_TO_ID)}"
+        ) from None
+
 
 def get_yaml_config():
     return f"""path: {YOLO_BASE}
