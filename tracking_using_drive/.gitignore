@@ -1,0 +1,25 @@
+# Local data cache — Phase 1's CAPSTONE_DIR bootstrap points space_debris's
+# paths here. Holds Drive-synced images and synthesised sequences; can be tens
+# of gigabytes. Never commit.
+_data/
+
+# OAuth client secret + stored refresh token. See rules.md FR-3.2 / D3.
+credentials.json
+*.json.key
+
+# Model weights (never in the repo; gitignored upstream too)
+*.pt
+*.onnx
+*.engine
+
+# Run outputs and synthesised sequences
+runs/
+*.mp4
+*.avi
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
