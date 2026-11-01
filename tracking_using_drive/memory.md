@@ -12,8 +12,9 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 0 — complete.** Environment audited, deps installed, data verified, isolation confirmed. |
-| Code changes made | **None.** Planning docs only (3 commits). |
+| Active phase | **Phase 1 — complete.** Package skeleton, scoped bootstrap, CLI, tests. |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (Phase 1 code + planning docs). |
+| Isolation verified | `git status` clean outside the folder; 14/14 library paths scoped under `_data/` |
 | Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
 | Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
 
@@ -133,6 +134,60 @@ See **D13** for the proposed workaround.
 | Baseline `stream` run | ⏳ Needs weights (D14 path) or injected detections (D13) |
 | Reproduce degenerate case | ⏳ Same — doable via D13 without any weights |
 | `make_demo_video.py` run | ⏳ Needs one synced image |
+
+---
+
+## Phase 1 Record (complete 2026-11-01)
+
+### Delivered
+| File | Role |
+|------|------|
+| `__init__.py` | Cheap bootstrap — puts repo root on `sys.path` and sets `CAPSTONE_DIR`. No torch, no library import. |
+| `config.py` | Heavy import, path guard, `verify_scoped_paths()`, `data_presence()`. |
+| `cli.py` | argparse entry point; `status` and `verify` implemented, roadmap in `--help`. |
+| `main.py` | `python -m tracking_using_drive.main <cmd>` |
+| `tests/test_config.py` | 11 tests incl. two subprocess tests of the bootstrap. |
+| `.gitignore` | Guards `_data/`, `credentials.json`, weights, runs. |
+
+### The two-layer bootstrap
+1. `__init__.py` sets `CAPSTONE_DIR` **cheaply** on package import — before
+   anything can import the library. This is what makes the scoping robust no
+   matter how the package is entered.
+2. `config.py` adds `_guard_pre_existing_import()`, which raises
+   `RuntimeError` if `space_debris.config` was already imported with a
+   `BASE_DIR` outside the package. Once imported, that value is fixed for the
+   life of the process and re-importing cannot move it.
+
+Both layers are exercised by subprocess tests, so a regression fails the suite
+rather than silently scattering directories.
+
+### G2 reproduced and confirmed
+Importing `space_debris.config` with an unscoped `CAPSTONE_DIR` created
+`processed/`, `labels_yolo/`, `model_checkpoints/` and `runs/` **in the
+repository root**. Observed directly during Phase 0 verification, then cleaned
+up. The bootstrap now routes all four into `tracking_using_drive/_data/`.
+
+### New gotchas found while building it
+- **G14** — `space_debris.config.verify_paths()` prints U+2713/U+2717. The
+  Windows console default is cp1252, which cannot encode them, so calling it
+  raises `UnicodeEncodeError`. We do not call it; `data_presence()` checks the
+  paths directly and returns a dict. `cli.py` also reconfigures stdio to UTF-8
+  with `errors="replace"` so an unencodable glyph cannot kill the process.
+- **G15** — `space_debris.config` prints `Using device: cpu` on import. A
+  library side effect we cannot remove (R0). Harmless; appears above our
+  banner. Suppressing it would risk hiding real warnings, so it stays.
+- **G16** — running pytest from the repo root creates `.pytest_cache/` there.
+  Gitignored by the upstream `.gitignore`, so no R0 violation, but remove it
+  rather than let it accumulate. Run with `-p no:cacheprovider` to avoid.
+
+### Test results
+```
+11 passed in 10.33s
+```
+Covers: no path escapes the package, `CAPSTONE_DIR` points inside it,
+`BASE_DIR` matches the env var, class taxonomy order (R1 guard), `DEBRIS_CLASSES`,
+`class_id` hit/miss, bootstrap scoping in a fresh interpreter, the
+unscoped-import guard firing, and `cli verify` returning 0.
 
 ---
 
@@ -265,7 +320,6 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G2 | `config.py:117-118` creates four directories at import. | Unavoidable side effect. D10 scopes it under `_data/`. |
 | G3 | `persist=True` required on every `model.track()`. | No error without it; all cross-frame identity destroyed. |
 | G4 | `torch.backends.mkldnn.enabled = False` (`train_resilient.py:12`). | oneDNN SIGFPEs on virtualised CPUs (JarvisLabs). |
-| G5 | `requirements-gpu.txt` must not pin `torch`/`torchvision`. | JarvisLabs template supplies CUDA builds. **Note: editing it is now out of bounds anyway.** |
 | G6 | Split seed is 42 (`split_dataset.py:35`). | Changing invalidates prior comparisons. Prefer Drive's shipped `train.csv`/`val.csv` — already zero-overlap. |
 | G7 | `preprocess.py` caps at 2000 images by default. | Workspace holds ~66k. |
 | G8 | Track/Stream pass source **directly** to Ultralytics — no preprocessing. | The data pipeline applies grayscale + CLAHE. Parity is R5. |
@@ -274,6 +328,9 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G11 | Installed ultralytics is **8.4.197**; `requirements.txt` pins **8.4.161**. | Tracker internals and default YAMLs can differ across versions. Record the version in every run's metadata, and pin back to 8.4.161 if a result looks version-dependent. Cannot edit `requirements.txt` (R0). |
 | G12 | **`scripts/jarvis.sh upload` pushes local `train/` and `labels/`** to the instance. | Drive sync (Phase 2) is a hard prerequisite for JarvisLabs training — the data must be local before it can be uploaded. |
 | G13 | `requirements-gpu.txt` must **not** pin `torch`/`torchvision`. | The JarvisLabs pytorch template supplies CUDA builds; pinning overrides them with CPU wheels. Out of bounds to edit anyway (R0). |
+| G14 | `space_debris.config.verify_paths()` prints U+2713/U+2717 (`✓`/`✗`). | The Windows console default is **cp1252**, which cannot encode those glyphs — calling it raises `UnicodeEncodeError`. Use `data_presence()` from `tracking_using_drive.config`, which returns a dict and prints nothing. |
+| G15 | `space_debris.config` prints `Using device: cpu` on import. | An unavoidable library side effect (R0). It appears above our banner. Suppressed stdout could hide real warnings, so it is left visible. |
+| G16 | Running pytest from the repo root creates `.pytest_cache/` there. | Gitignored by the upstream `.gitignore`, so it is not an R0 violation — but remove it rather than let it accumulate. Run with `-p no:cacheprovider` to avoid it entirely. |
 
 ---
 
@@ -352,21 +409,52 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - Added G11 (ultralytics 8.4.197 vs. pinned 8.4.161), G12 (jarvis.sh needs
   local data), G13 (never pin torch in requirements-gpu.txt).
 - **No runtime code changed.**
+- **Pushed** `d1ddc75`, `d3f4604`, `4494973` to `origin/tracking_using_drive`
+  on request.
+
+### 2026-11-01 — Phase 1: package skeleton and bootstrap
+- **Wrote the Phase 1 code**, all inside `tracking_using_drive/`:
+  `__init__.py`, `config.py`, `cli.py`, `main.py`, `tests/test_config.py`,
+  plus the `.gitignore` from earlier.
+- **G2 reproduced during verification.** Importing `space_debris.config` with
+  an unscoped `CAPSTONE_DIR` created `processed/`, `labels_yolo/`,
+  `model_checkpoints/` and `runs/` **in the repository root**. Removed all four
+  (empty) afterward. This is the exact hazard the bootstrap exists to prevent,
+  and it is now confirmed empirically rather than by reading.
+- **Implemented the two-layer bootstrap.** `__init__.py` primes
+  `CAPSTONE_DIR` cheaply (no torch, no library import) on *any* package entry;
+  `config.py` adds `_guard_pre_existing_import()` which raises `RuntimeError`
+  if `space_debris.config` was already imported out of scope. Both layers are
+  covered by fresh-interpreter subprocess tests.
+- **Found G14:** `space_debris.config.verify_paths()` prints U+2713/U+2717,
+  which the Windows cp1252 console default cannot encode — calling it crashes
+  with `UnicodeEncodeError`. Replaced with `data_presence()`, which returns a
+  dict instead of printing. `cli.py` also reconfigures stdio to UTF-8 with
+  `errors="replace"` so no unencodable glyph can kill the process.
+- **Found G15:** the library prints `Using device: cpu` on import — a side
+  effect we cannot remove (R0). Left visible rather than suppressed, since
+  suppressing stdout could hide real warnings.
+- **Found G16:** pytest from the repo root drops `.pytest_cache/` there.
+  Gitignored upstream (no R0 violation) but removed after the run.
+- **11/11 tests pass** in 10.33s.
+- `python -m tracking_using_drive.main status` reports all 14 library paths
+  scoped under `tracking_using_drive/_data/`. `verify` exits 0.
 
 ---
 
 ## Next Actions
 
-1. **Phase 1 — package skeleton.** `__init__.py`, `config.py` with the
-   `CAPSTONE_DIR` bootstrap, `cli.py`/`main.py`. Include a test asserting the
-   resolved paths stay inside the R0 boundary (G1).
-2. **Phase 2 — Drive access and local staging.** Deterministic credentials,
+1. **Phase 2 — Drive access and local staging.** Deterministic credentials,
    selective sync allowlist, `gdrive://` resolution, **and** the local
    `train/` + `labels/train.csv` layout `jarvis.sh upload` expects (G12).
-3. **Phase 3 — sequence synthesis.** Unblocked and weight-free.
-4. Resolve Q7 (which subfolder to sync) during Phase 2 design.
+2. **Phase 3 — sequence synthesis.** Unblocked and weight-free.
+3. Resolve Q7 (which subfolder to sync) during Phase 2 design — decide between
+   syncing `yolo_dataset/` directly and rebuilding it from `train/` +
+   `train.csv`. The answer determines the sync allowlist's size.
+4. Commit and push the Phase 1 code before starting Phase 2, so the invariant
+   guards are in version control ahead of the code that depends on them.
 5. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
    it is the sole optional phase.
 
-The scope is locked (D8) and no gate remains. Phases 1–4 and 6–7 need no
+The scope is locked (D8) and no gate remains. Phases 2–4 and 6–7 need no
 external credentials or GPU budget.
