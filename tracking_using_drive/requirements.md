@@ -252,3 +252,4 @@ that import the untouched originals where they are correct.
 |---|----------|--------|
 | Q7 | Should `yolo_dataset/` be synced directly (it is already split into `images/` + `labels/`), or rebuilt from `train/` + `labels/train.csv`? | Sync scope and runtime. |
 | Q8 | Should `val.csv` (22k images, currently unused by the codebase) be used as the pool from which synthesis stills are drawn? | Evaluation design. |
+| Q9 | Is a JarvisLabs token available, and what GPU budget is acceptable? | **Phase 5 only.** Phases 3, 4, 6, 7 complete via D13 without it. |

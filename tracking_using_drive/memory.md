@@ -12,10 +12,10 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 0 — Baseline and Data Verification** (partially complete) |
-| Code changes made | **None.** Planning docs only, committed as `d1ddc75`. |
-| Baseline recorded | **No — BLOCKED on model weights** (see §Environment) |
-| Blocking question | Scope gate **RESOLVED** (Option A). A new blocker appeared: no weights. |
+| Active phase | **Phase 0 — complete.** Environment audited, deps installed, data verified, isolation confirmed. |
+| Code changes made | **None.** Planning docs only (3 commits). |
+| Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
+| Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
 
 ### Goal
 Complete the tracking of debris using the data stored in Google Drive.
@@ -85,15 +85,19 @@ Local machine, `C:\Users\naras\OneDrive\Desktop\Capstone\SpaceDebrisDetector`:
 | Item | Value | Consequence |
 |------|-------|-------------|
 | Python | 3.12.2 | OK |
-| torch | **2.7.1+cpu** | CPU only. No CUDA, no MPS. |
-| ultralytics | **MISSING** | Cannot run YOLO at all yet. |
-| pydrive2 | **MISSING** | Cannot do Drive sync yet. |
+| torch | **2.15.0+cpu** (upgraded from 2.7.1 by ultralytics) | CPU only locally. No CUDA, no MPS. |
+| ultralytics | **8.4.197** ✅ installed | Repo pins `8.4.161` — see G11. |
+| pydrive2 | **installed** ✅ | Drive sync now possible. |
 | cv2 / numpy / pandas | 4.11.0 / 2.0.1 / 2.2.2 | Present. |
 | Data locally | **none** | No `train/`, `labels/`, `processed/`, `yolo_dataset/`. |
 | Weights locally | **none** | No `.pt` anywhere in the repo. |
+| **Training platform** | **JarvisLabs (GPU)** | Local torch is CPU-only by design. See D14. |
 
 Git identity had to be set locally (`user.name = "naras"`) — `user.email` was
 already configured. Change it if a different name is wanted.
+
+A pre-existing unrelated pip warning: `wsproto 1.3.2 requires h11<1,>=0.16.0,
+but you have h11 0.14.0`. Does not affect this work.
 
 ### The weights blocker
 
@@ -123,11 +127,62 @@ See **D13** for the proposed workaround.
 | Task | Status |
 |------|--------|
 | Environment audit | ✅ Done |
+| Install `ultralytics` + `pydrive2` | ✅ Done (8.4.197, pydrive2) |
 | Verify Drive CSV facts locally | ✅ Done (66k/22k, 1 annot each, zero overlap) |
 | Confirm R0 isolation | ✅ Done — `git status` clean outside the folder |
-| Baseline `stream` run | ❌ Blocked — no weights, no data, no ultralytics |
-| Reproduce degenerate case | ❌ Blocked — same |
-| `make_demo_video.py` run | ❌ Blocked — needs a local image |
+| Baseline `stream` run | ⏳ Needs weights (D14 path) or injected detections (D13) |
+| Reproduce degenerate case | ⏳ Same — doable via D13 without any weights |
+| `make_demo_video.py` run | ⏳ Needs one synced image |
+
+---
+
+## JarvisLabs Training Flow (D14)
+
+The repo is already provisioned for GPU training off-box. What the branch must
+add is the **Drive → local → JarvisLabs** handoff, which does not exist yet.
+
+### Existing tooling
+| Asset | Role |
+|-------|------|
+| `train_jarvis.py` | Entrypoint: rebuild the YOLO dataset if needed, then `train_with_recovery()`. Sets `CAPSTONE_DIR` to the project root. |
+| `scripts/jarvis.sh` | Instance lifecycle: `status`, `create [GPU]`, `upload <id>`, `train <id>`, `logs`, `pause`, `destroy`. |
+| `requirements-gpu.txt` | GPU deps. Deliberately unpins torch. |
+| `models/train_resilient.py` | Crash recovery, per-epoch logging, weight-carry across failures. |
+
+### Current flow
+```bash
+jl setup --token YOUR_TOKEN --agents universal --yes   # one-time auth
+./scripts/jarvis.sh create L4        # ~120GB: raw + processed + yolo_dataset + ckpts
+./scripts/jarvis.sh upload <id>      # pushes space_debris/, train_jarvis.py,
+                                     #   requirements-gpu.txt, train/, labels/
+./scripts/jarvis.sh train <id> --epochs 30 --batch 16
+```
+
+### The gap this branch must close
+`jarvis.sh upload` pushes **local** `train/` and `labels/`. Those do not exist
+locally — they live in Drive. So today the flow cannot start.
+
+**Required addition:** a `tracking_using_drive`-owned step that syncs
+`labels/train.csv`, `labels/val.csv` (and the images) from Drive into the
+layout `jarvis.sh` expects, **before** `upload`. This is Phase 2's deliverable
+and is why Phase 2 precedes any training.
+
+### What the branch does NOT do
+- It does not edit `jarvis.sh`, `train_jarvis.py`, or `train_resilient.py`
+  (R0). It orchestrates around them.
+- It does not retrain the detector as part of tracking validation. Training is
+  a one-time upstream step whose output (`best.pt`) the branch consumes.
+
+### Two paths to detections, used together
+| Path | Unblocks | Needs |
+|------|----------|-------|
+| **D13 — injected detections** | Tracking-layer validation now (Phases 3–4) | Nothing |
+| **D14 — JarvisLabs training** | Full end-to-end validation with a real detector (Phase 5) | JarvisLabs token, synced data, GPU time |
+
+D13 is not a fallback for D14 — it validates a *different layer*. Tracking
+correctness (missed-detection propagation, track continuity, Kalman, orbit) is
+provable without any detector. Detection accuracy is a separate claim that
+needs the JarvisLabs run.
 
 ---
 
@@ -147,7 +202,8 @@ See **D13** for the proposed workaround.
 | D10 | 2026-11-01 | Set `CAPSTONE_DIR` **before** importing `space_debris.config`, scoping its paths under `tracking_using_drive/_data/`. | `config.py:19-20` reads the env at import and `:117-118` creates dirs at import. Cannot edit either; must control via environment. |
 | D11 | 2026-11-01 | Selective sync via allowlist, not whole-folder. | Folder holds `train/`, `processed/`, `yolo_dataset/` — three overlapping copies totalling 88k images. A tracking run needs a slice. |
 | **D12** | **2026-11-01** | **Occlusion is implemented by erasing the object region, not translating it off-canvas.** | Off-canvas translation can leave the object detectable depending on padding. Erasure guarantees a true dropout, which is the only way to test D4/FR-4.1. |
-| **D13** | **2026-11-01 (PROPOSED)** | **Validate the tracking layer in isolation by injecting synthesised detections at known centres, decoupling it from the detector.** `sequence.py` already knows the exact object position per frame, so it can emit a detection stream directly. | No weights are reachable (see §Environment). This unblocks Phases 3–5 entirely, and isolates precisely the layer this branch fixes — missed-detection propagation and track continuity. Detection accuracy becomes a separate, later concern. **Needs user confirmation.** |
+| **D13** | **2026-11-01** | **Validate the tracking layer in isolation by injecting synthesised detections at known centres, decoupling it from the detector.** `sequence.py` already knows the exact object position per frame, so it can emit a detection stream directly. | No weights are reachable from the share. This unblocks Phases 3–5 immediately, and isolates precisely the layer this branch fixes — missed-detection propagation and track continuity. Complements D14 rather than replacing it: real weights still matter for the full detection→tracking path. |
+| **D14** | **2026-11-01** | **Training runs on JarvisLabs GPU, not locally. Local torch stays CPU-only.** | Stated by the project owner. The repo is already provisioned for this: `train_jarvis.py` (rebuild pipeline + train), `scripts/jarvis.sh` (instance lifecycle), `requirements-gpu.txt` (no torch pin — the pytorch template supplies CUDA builds). Local CPU is used only for inference and validation. |
 
 ---
 
@@ -215,6 +271,9 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G8 | Track/Stream pass source **directly** to Ultralytics — no preprocessing. | The data pipeline applies grayscale + CLAHE. Parity is R5. |
 | G9 | `orbit.py` assumes `cx`/`cy` in `[0,1]`. | The `abs(cx) > 1.5` check (`orbit.py:295`) is a legacy fallback, not a licence for pixel centres. |
 | G10 | Drive folder holds **three overlapping copies** of the images (`train/`, `processed/`, `yolo_dataset/`). | Whole-folder sync is wasteful and slow. D11. |
+| G11 | Installed ultralytics is **8.4.197**; `requirements.txt` pins **8.4.161**. | Tracker internals and default YAMLs can differ across versions. Record the version in every run's metadata, and pin back to 8.4.161 if a result looks version-dependent. Cannot edit `requirements.txt` (R0). |
+| G12 | **`scripts/jarvis.sh upload` pushes local `train/` and `labels/`** to the instance. | Drive sync (Phase 2) is a hard prerequisite for JarvisLabs training — the data must be local before it can be uploaded. |
+| G13 | `requirements-gpu.txt` must **not** pin `torch`/`torchvision`. | The JarvisLabs pytorch template supplies CUDA builds; pinning overrides them with CPU wheels. Out of bounds to edit anyway (R0). |
 
 ---
 
@@ -225,6 +284,7 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | Q4 | Observer-to-object range? | Physical speed stays `null` | OPEN — accepted as unknowable from data |
 | Q7 | Sync `yolo_dataset/` directly (already split) or rebuild from `train/` + `train.csv`? | Sync scope, runtime | OPEN |
 | Q8 | Use `val.csv` (22k images) as the pool for synthesis stills? | Evaluation design | OPEN |
+| Q9 | JarvisLabs token available? GPU budget? | **Phase 5 only** — Phases 3/4/6/7 work via D13 without it | OPEN |
 
 Resolved: **Q1** (full layout), **Q2** (both raw and processed present),
 **Q3** (stills only — no video anywhere), **Q5** (no multi-object images),
@@ -271,29 +331,42 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - **Committed the planning set** as `d1ddc75` (7 files, 1,661 insertions),
   plus `tracking_using_drive/.gitignore` guarding `_data/`, `credentials.json`,
   and weights. Set local `user.name = "naras"` (was unset).
-- **Phase 0 environment audit.** Python 3.12.2, torch **CPU-only**
-  (2.7.1+cpu), cv2/numpy/pandas present, **`ultralytics` and `pydrive2`
-  missing**. No data and no weights locally.
+- **Phase 0 environment audit.** Python 3.12.2, torch **CPU-only**, cv2/numpy/
+  pandas present, **`ultralytics` and `pydrive2` missing**. No data and no
+  weights locally.
 - **Traced the weights.** `CAPSTONE.ipynb` shows models were trained in Google
   Colab and written to the author's **private** `MyDrive/Capstone/runs/`, which
   is not the shared folder. **No weights are reachable.** Raised **D13**
   (proposed) to validate the tracking layer via injected detections instead.
+- **Installed `ultralytics` 8.4.197 and `pydrive2`** (approved). torch bumped
+  2.7.1+cpu → 2.15.0+cpu as a transitive upgrade. Local remains CPU-only.
+- **D14 recorded: training runs on JarvisLabs GPU, not locally.** The repo is
+  already provisioned (`train_jarvis.py`, `scripts/jarvis.sh`,
+  `requirements-gpu.txt`). Added **Phase 5** to `phases.md` for the
+  Drive→local→JarvisLabs handoff, which does not exist today — `jarvis.sh
+  upload` pushes local `train/` and `labels/`, and those only live in Drive.
+  Phase 2 now owns that staging.
+- **Reframed D13 vs. D14 as complementary, not either/or.** D13 validates the
+  tracking layer with zero detector dependency; D14 produces `best.pt` for the
+  full detection→tracking path. Their results must be reported separately.
+- Added G11 (ultralytics 8.4.197 vs. pinned 8.4.161), G12 (jarvis.sh needs
+  local data), G13 (never pin torch in requirements-gpu.txt).
 - **No runtime code changed.**
 
 ---
 
 ## Next Actions
 
-1. **Start Phase 0.** Reproduce the degenerate case (stream over unrelated
-   stills → empty orbit report) so the need for synthesis is documented as
-   evidence, not assertion.
-2. **Phase 1** — package skeleton and the `CAPSTONE_DIR` bootstrap, with a
-   test that the resolved paths stay inside the R0 boundary.
-3. **Phase 2** — Drive access: deterministic credentials, selective sync
-   allowlist, `gdrive://` resolution.
-4. Commit the planning folder before any code, so the reasoning is in version
-   control ahead of the first implementation commit.
-5. Resolve Q7 (which Drive subfolder to sync) during Phase 2 design — it
-   affects runtime but not architecture.
+1. **Phase 1 — package skeleton.** `__init__.py`, `config.py` with the
+   `CAPSTONE_DIR` bootstrap, `cli.py`/`main.py`. Include a test asserting the
+   resolved paths stay inside the R0 boundary (G1).
+2. **Phase 2 — Drive access and local staging.** Deterministic credentials,
+   selective sync allowlist, `gdrive://` resolution, **and** the local
+   `train/` + `labels/train.csv` layout `jarvis.sh upload` expects (G12).
+3. **Phase 3 — sequence synthesis.** Unblocked and weight-free.
+4. Resolve Q7 (which subfolder to sync) during Phase 2 design.
+5. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
+   it is the sole optional phase.
 
-The scope is locked (D8). No further gate remains before Phase 3.
+The scope is locked (D8) and no gate remains. Phases 1–4 and 6–7 need no
+external credentials or GPU budget.

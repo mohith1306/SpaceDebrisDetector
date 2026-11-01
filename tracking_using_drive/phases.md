@@ -67,9 +67,10 @@ wrong `BASE_DIR`. Add a test asserting the resolved path is under
 
 ---
 
-## Phase 2 — Drive Access
+## Phase 2 — Drive Access and Local Staging
 
-**Goal:** Reach the Drive dataset with correct credentials and selective sync.
+**Goal:** Reach the Drive dataset with correct credentials, selective sync,
+and the local layout `scripts/jarvis.sh upload` expects (D12/G12).
 
 **Work**
 - [ ] `drive.py` — construct `GDriveSync` with explicit `cache_dir` and
@@ -77,14 +78,19 @@ wrong `BASE_DIR`. Add a test asserting the resolved path is under
 - [ ] Deterministic credential path, `GDRIVE_CREDENTIALS` override.
 - [ ] Actionable error when credentials are absent.
 - [ ] Selective sync allowlist: `labels/train.csv`, `labels/val.csv`,
-  `yolo_dataset/images/val/` — **not** the whole 88k-image folder.
+  `yolo_dataset/images/val/` — **not** the whole 88k-image folder (D11).
 - [ ] `source.py` — `resolve_source()` with `gdrive://` support.
 - [ ] Record `folder_id` and `cache_hit` for the output metadata.
+- [ ] **Local staging layout** — emit `train/` and `labels/train.csv` at the
+  repo root, because `jarvis.sh upload` pushes exactly those paths and cannot
+  be edited (R0). This is the Drive→JarvisLabs handoff that does not exist
+  today.
 
 **Exit criterion**
 Cold cache: syncs the allowlisted slice and resolves to a local path.
 Warm cache with `--no-sync`: **zero** network calls.
 `grep -rE "E:/Capstone|Path\(.credentials" tracking_using_drive/` → empty.
+`train/` and `labels/train.csv` exist where `jarvis.sh upload` expects them.
 
 **Risk:** PyDrive2 OAuth opens a browser on first run. Validate the warm path
 immediately after one successful auth, or the credential bug will hide.
@@ -124,9 +130,18 @@ synthesis. Tune `dx`/`dy` against object size before blaming the tracker.
 
 **Goal:** Tracks survive occlusion. The branch's second core contribution.
 
+**Unblocked without weights (D13).** Because `sequence.py` knows the exact
+object centre for every frame it renders, it can emit a detection stream
+directly at those centres. That validates ByteTrack → Kalman → orbit
+independently of any detector, and isolates precisely the layer this branch
+fixes. Real weights (Phase 5) are needed only for the *full* end-to-end path.
+
 **Work**
 - [ ] `stream.py` — reimplement `run_stream` importing `TrajectoryBank`,
   `summarize_track`, `classify_crops`, `fuse`, `resolve_model`, `probe_fps`.
+- [ ] **D13 injection path** — accept a pre-computed detection stream (from
+  `sequence.py`'s ground truth) in place of `model.track()`, so the tracking
+  layer can be exercised with zero detector dependency.
 - [ ] Missed-detection propagation: `bank.miss(tid, dt=1.0/rate)` for every
   active, unobserved, unexpired track.
 - [ ] `missed` / `expired` counters; `--max-missed` (default 30).
@@ -136,7 +151,7 @@ synthesis. Tune `dx`/`dy` against object size before blaming the tracker.
 - [ ] Expired tracks excluded from the orbit report but history retained.
 
 **Exit criterion**
-On the occlusion fixture from Phase 3:
+On the occlusion fixture from Phase 3, using injected detections:
 - track ID preserved across the gap;
 - during the gap `motion` is non-zero and consistent with pre-gap velocity
   (the filter **predicted**, it did not freeze);
@@ -148,14 +163,54 @@ Plus: no regression on the Phase 3 angular-rate check.
 disagreeing with our timing about when to resume. If IDs still fragment, raise
 `max_missed` above ByteTrack's cooldown — do not remove the Kalman prediction.
 
+**Note:** injected detections carry `class_id`/`conf` from ground truth, so
+this phase validates *association and motion*, not detection quality. Do not
+report it as detector performance.
+
 ---
 
-## Phase 5 — End-to-End Validation
+## Phase 5 — Detector Training on JarvisLabs
+
+**Goal:** Produce a real `best.pt` so the full detection→tracking path can be
+exercised. D14.
+
+**Prerequisite:** Phase 2 must have staged `train/` and `labels/train.csv`
+locally — `scripts/jarvis.sh upload` pushes exactly those paths and cannot be
+edited (R0/G12).
+
+**Work**
+- [ ] Confirm JarvisLabs auth: `jl status`. **Needs a token — see Q9.**
+- [ ] `jl create L4 --storage 120` (raw ~14GB + processed ~17GB +
+  yolo_dataset ~17GB + checkpoints).
+- [ ] `jarvis.sh upload <id>` — pushes `space_debris/`, `train_jarvis.py`,
+  `requirements-gpu.txt`, `train/`, `labels/`.
+- [ ] `jarvis.sh train <id> --epochs 30 --batch 16` → `train_jarvis.py` →
+  `train_with_recovery()` (P1/P2 head, crash recovery, per-epoch logging).
+- [ ] Fetch `best.pt` back to `tracking_using_drive/_data/weights/`.
+- [ ] `jarvis.sh pause <id>` to stop billing.
+- [ ] Record the ultralytics version on the instance vs. local **8.4.197**
+  (G11) — a mismatch can explain result drift.
+
+**Exit criterion**
+`best.pt` present locally, `jarvis.sh pause` run, and the training session ID
+plus final metrics recorded in `memory.md`.
+
+**Risk:** this is the only phase needing external credentials, GPU budget, and
+roughly an hour. It is also the only phase that can be deferred indefinitely —
+Phases 3, 4 and 6 all work via D13 without it.
+
+---
+
+## Phase 6 — End-to-End Validation
 
 **Goal:** Prove the full chain, and document honestly what it can claim.
 
 **Work**
-- [ ] Full run: Drive → sync → synthesise → detect → track → Kalman → orbit.
+- [ ] **Via D13:** full chain Drive → sync → synthesise → injected detections →
+  track → Kalman → orbit.
+- [ ] **Via D14 (if `best.pt` available):** repeat with the real detector so
+  detection→tracking integration is covered. Report the two separately — they
+  are different claims.
 - [ ] Sweep `--fov` and `--range-km`; record how `speed_km_s` and
   `consistent_with_circular_orbit` respond.
 - [ ] Confirm that with no `--range-km` every track reports
@@ -180,7 +235,7 @@ that plainly — an honest limitation beats an unsupported metric.
 
 ---
 
-## Phase 6 — Hardening and Closeout
+## Phase 7 — Hardening and Closeout
 
 **Goal:** Safe to merge, legible to the next person.
 
@@ -190,7 +245,7 @@ that plainly — an honest limitation beats an unsupported metric.
   synthesised videos are staged.
 - [ ] Re-run Phase 0, 3, 4 validations on final code.
 - [ ] Tests: `test_source.py`, `test_sequence.py`, `test_missed_detections.py`.
-- [ ] Close out `requirements.md` §8 — Q7 and Q8 answered or explicitly
+- [ ] Close out `requirements.md` §8 — Q7, Q8, Q9 answered or explicitly
   "accepted as unknown".
 - [ ] Prune stale entries from `memory.md`; write the final state.
 - [ ] PR against `main`, evidence attached phase by phase.
@@ -205,16 +260,32 @@ reflects reality.
 ## Dependency Graph
 
 ```
-Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 5 ──► Phase 6
+Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 6 ──► Phase 7
+              │            │           │            │           ▲
               │            │           │            │           │
-              │            │           └─── synthesises the sequences Phase 4 tests on
-              │            └─── Drive stills are the Phase 3 input
-              └─── bootstrap everything else depends on
+              │            │           │            └─ D13 ─────┘
+              │            │           │        (injected detections:
+              │            │           │         no weights required)
+              │            │           │                              │
+              │            │           └── synthesises the sequences │
+              │            │               Phase 4 tests on          │
+              │            │                                         │
+              │            └── Drive stills are the Phase 3 input;   │
+              │                staged layout feeds Phase 5           │
+              │                                                      │
+              └── bootstrap everything else depends on               │
+                                                                 │
+              Phase 5 (JarvisLabs training) ──── best.pt ────────────┘
+                  OPTIONAL — only needed for the full
+                  detection→tracking path in Phase 6
 ```
 
-Strictly sequential — each phase's output is the next phase's input. The one
-parallelism available is Phase 6's test scaffolding, which can be written from
-Phase 1 onward.
+**Phase 5 is the only optional phase.** Phases 3, 4, 6 and 7 all complete via
+D13 without any detector. Phase 5 exists to additionally cover
+detection→tracking integration, and depends on external credentials, GPU
+budget, and Phase 2's local staging.
+
+Everything else is strictly sequential.
 
 ---
 
@@ -222,13 +293,14 @@ Phase 1 onward.
 
 | Phase | Effort | Notes |
 |-------|--------|-------|
-| 0 — Baseline | Small | Running commands, recording numbers. |
+| 0 — Baseline | Small | Environment + data verification. **Mostly done.** |
 | 1 — Skeleton | Small | Bootstrap + CLI wiring. |
-| 2 — Drive access | Medium | OAuth validation, selective sync. |
-| 3 — Sequence synthesis | **Largest** | New capability, ground truth correctness, occlusion-by-erasure. |
-| 4 — Tracking correctness | Medium-Large | New state machine, real risk of ByteTrack interaction. |
-| 5 — Validation | Medium | FOV/range sweep, honest reporting. |
-| 6 — Closeout | Small | Mechanical. |
+| 2 — Drive access and staging | Medium | OAuth validation, selective sync, JarvisLabs layout. |
+| 3 — Sequence synthesis | **Largest** | New capability, ground-truth correctness, occlusion-by-erasure. |
+| 4 — Tracking correctness | Medium-Large | New state machine + D13 injection path. |
+| 5 — JarvisLabs training | **External** | Needs token, GPU time, ~1hr. Deferrable. |
+| 6 — Validation | Medium | FOV/range sweep, honest reporting. |
+| 7 — Closeout | Small | Mechanical. |
 
 ---
 
@@ -244,13 +316,17 @@ Phase 1 onward.
 tracking pipeline with quantified error against known ground truth, derived
 from synthesised sequences over Drive stills.
 
-Two consequences worth carrying into Phases 3–5:
+Consequences carried into Phases 3–7:
 
-1. **Success is a measured error bar, not an orbit.** Phase 5 reports angular-
+1. **Success is a measured error bar, not an orbit.** Phase 6 reports angular-
    rate recovery accuracy and track-continuity metrics. It does not report
    determined orbits, and must not be written up as if it did.
 2. **The 22k-image `val.csv` is the natural synthesis pool** (Q8). Drawing
    stills from a held-out split keeps the synthesised sequences independent of
    whatever the detector was trained on.
+3. **Two validation claims, reported separately (D13 vs. D14).** Tracking-layer
+   correctness is provable with injected detections and no weights. Detector
+   accuracy needs the Phase 5 JarvisLabs run. Merging them into one number
+   would misrepresent both.
 
 No gate remains. Phases proceed sequentially from Phase 0.
