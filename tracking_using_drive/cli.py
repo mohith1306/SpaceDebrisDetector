@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import PACKAGE_DIR, __version__
 
@@ -22,7 +23,8 @@ ROADMAP = """\
 roadmap (see tracking_using_drive/phases.md):
   status        resolved paths, device, environment          [Phase 1 - now]
   verify        assert no library path escapes the package   [Phase 1 - now]
-  sync          selective Google Drive sync                  [Phase 2]
+  sync          selective Google Drive sync                  [Phase 2 - now]
+  source        resolve a source (incl. gdrive://)           [Phase 2 - now]
   synth         still -> synthetic sequence + ground truth   [Phase 3]
   track         detect + track, with missed-detection fix    [Phase 4]
   stream        full pipeline: track -> classify -> orbit    [Phase 4]
@@ -106,6 +108,83 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+def _cmd_sync(args: argparse.Namespace) -> int:
+    """Selective Drive sync. Anonymous by default (D15); no credentials needed."""
+    from .drive import DriveError, TRACKING_ALLOWLIST, sync_allowlist
+
+    allowlist = tuple(args.path) if args.path else TRACKING_ALLOWLIST
+    try:
+        report = sync_allowlist(
+            allowlist,
+            folder_id=args.folder_id,
+            cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+            no_sync=args.no_sync,
+            workers=args.workers,
+        )
+    except DriveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps({
+            **report.as_metadata(),
+            "root": str(report.root),
+            "downloaded": report.downloaded,
+            "cache_hits": report.cache_hits,
+            "bytes_downloaded": report.bytes_downloaded,
+            "network_calls": report.network_calls,
+        }, indent=2))
+        return 0
+
+    mode = "cache (no network)" if report.from_cache else "synced"
+    print(f"Drive sync ({mode})")
+    print(f"  root           {report.root}")
+    print(f"  folder_id      {report.folder_id}")
+    print(f"  files          {len(report.files)}")
+    print(f"  downloaded     {report.downloaded}")
+    print(f"  cache hits     {report.cache_hits}")
+    print(f"  bytes          {report.bytes_downloaded:,}")
+    print(f"  network calls  {report.network_calls}")
+    if report.truncated_folders:
+        print("  TRUNCATED      these folders hit the public listing cap (G17):")
+        for name in report.truncated_folders:
+            print(f"                   {name}")
+        print("                   A full sync of these requires OAuth (--oauth).")
+    return 0
+
+
+def _cmd_source(args: argparse.Namespace) -> int:
+    """Resolve a source, including gdrive:// paths, and report where it lands."""
+    from .drive import DriveError
+    from .source import resolve_source
+
+    try:
+        resolved = resolve_source(args.source, no_sync=args.no_sync)
+    except (DriveError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps({"input": args.source, "resolved": str(resolved)}, indent=2))
+        return 0
+
+    print(f"source   {args.source or '(default)'}")
+    print(f"resolved {resolved}")
+    if isinstance(resolved, int):
+        print("kind     camera index")
+    else:
+        from .source import is_still, is_video
+        p = Path(resolved)
+        if p.is_dir():
+            n = sum(1 for x in p.iterdir() if x.is_file())
+            print(f"kind     directory ({n} files)")
+        elif is_video(p):
+            print("kind     video")
+        elif is_still(p):
+            print("kind     still — must be synthesised before tracking (D8/R9)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tracking_using_drive",
@@ -124,6 +203,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify = sub.add_parser("verify", help="assert no library path escapes the package (R0)")
     p_verify.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     p_verify.set_defaults(func=_cmd_verify)
+
+    p_sync = sub.add_parser(
+        "sync",
+        help="selectively sync a slice of the shared Drive folder (anonymous, no credentials)",
+    )
+    p_sync.add_argument(
+        "path", nargs="*",
+        help="folder-relative path(s) to sync; default is the tracking allowlist",
+    )
+    p_sync.add_argument(
+        "--folder-id", default=None,
+        help="Drive folder id (default: the shared Capstone folder)",
+    )
+    p_sync.add_argument(
+        "--cache-dir", default=None,
+        help="destination root (default: tracking_using_drive/_data/gdrive_cache)",
+    )
+    p_sync.add_argument(
+        "--no-sync", action="store_true",
+        help="resolve from the warm cache only; error if it cannot (FR-2.4/R10)",
+    )
+    p_sync.add_argument(
+        "--workers", type=int, default=4,
+        help="concurrent downloads (default 4; the anonymous endpoint rate-limits)",
+    )
+    p_sync.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_sync.set_defaults(func=_cmd_sync)
+
+    p_source = sub.add_parser(
+        "source",
+        help="resolve a source (local path, camera index, or gdrive://subpath)",
+    )
+    p_source.add_argument(
+        "source", nargs="?", default=None,
+        help="e.g. gdrive://yolo_dataset/images/val, /path/to/dir, or 0 for a camera",
+    )
+    p_source.add_argument(
+        "--no-sync", action="store_true",
+        help="resolve gdrive:// from the warm cache only",
+    )
+    p_source.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_source.set_defaults(func=_cmd_source)
 
     return parser
 

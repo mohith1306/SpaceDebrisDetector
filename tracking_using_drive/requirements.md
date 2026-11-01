@@ -222,8 +222,10 @@ that import the untouched originals where they are correct.
 1. A fresh clone resolves the Drive folder by ID and produces a JSONL with
    non-null `track_id` values.
 2. A second identical run performs **zero** downloads.
-3. `grep -rE "E:/Capstone|Path\(.credentials" tracking_using_drive/` returns
-   nothing.
+3. `python -m pytest tracking_using_drive/tests -q -k hardcoded` passes —
+   no hardcoded absolute path appears as a code constant. (A raw grep is
+   unsatisfiable: the guard and the module docstrings quote the literal
+   deliberately, to explain the defect it prevents.)
 4. `git status` outside `tracking_using_drive/` is clean after every commit.
 5. A synthesised sequence with known `dx`/`dy` yields an angular rate within
    **10%** of ground truth.

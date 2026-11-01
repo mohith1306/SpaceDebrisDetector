@@ -72,24 +72,42 @@ wrong `BASE_DIR`. Add a test asserting the resolved path is under
 **Goal:** Reach the Drive dataset with correct credentials, selective sync,
 and the local layout `scripts/jarvis.sh upload` expects (D12/G12).
 
+**Status: core complete 2026-11-01. JarvisLabs staging deferred** — it needs
+an R0 decision (see the last work item) and only Phase 5 consumes it.
+
 **Work**
-- [ ] `drive.py` — construct `GDriveSync` with explicit `cache_dir` and
-  `credentials_file`, defeating `gdrive_sync.py:15` and `:18`.
-- [ ] Deterministic credential path, `GDRIVE_CREDENTIALS` override.
-- [ ] Actionable error when credentials are absent.
-- [ ] Selective sync allowlist: `labels/train.csv`, `labels/val.csv`,
-  `yolo_dataset/images/val/` — **not** the whole 88k-image folder (D11).
-- [ ] `source.py` — `resolve_source()` with `gdrive://` support.
-- [ ] Record `folder_id` and `cache_hit` for the output metadata.
+- [x] `drive.py` — anonymous-first access (D15). No OAuth required: the shared
+  folder is public, so listing and download both work credential-free. This
+  removed the `credentials.json` blocker from Phases 2–4 entirely.
+- [x] `GDriveSync` retained as the OAuth path for private folders, constructed
+  with explicit `cache_dir` and `credentials_file`, defeating
+  `gdrive_sync.py:15` and `:18`.
+- [x] Actionable error when the anonymous path hits a private folder, naming
+  `--oauth` as the remedy.
+- [x] Selective sync allowlist: `labels/train.csv`, `labels/val.csv`,
+  `yolo_dataset/images/val/`, `yolo_dataset/labels/val/` — **not** the whole
+  88k-image folder (D11). Measured: **1,086 files / ~164 MB**, against ~14 GB
+  for a whole-folder sync.
+- [x] Warm path via a manifest — **zero** network calls on a second run (R10).
+- [x] `source.py` — `resolve_source()` with `gdrive://` support, plus
+  `is_still()` so a single image can be routed to `sequence.py` instead of
+  being tracked as a length-1 track.
+- [x] Record `folder_id` and `cache_hit` via `SyncReport.as_metadata()`.
 - [ ] **Local staging layout** — emit `train/` and `labels/train.csv` at the
   repo root, because `jarvis.sh upload` pushes exactly those paths and cannot
-  be edited (R0). This is the Drive→JarvisLabs handoff that does not exist
-  today.
+  be edited (R0). **Deferred: needs an R0 decision.** Both `train/` and
+  `labels/` are gitignored upstream, so creating them is not a *source* change
+  — but R0's wording ("no file outside it may be added") is broad enough to
+  warrant explicit confirmation. Options and the OneDrive caveat are in
+  `memory.md` Next Actions.
 
 **Exit criterion**
 Cold cache: syncs the allowlisted slice and resolves to a local path.
 Warm cache with `--no-sync`: **zero** network calls.
-`grep -rE "E:/Capstone|Path\(.credentials" tracking_using_drive/` → empty.
+`python -m pytest tracking_using_drive/tests -q -k hardcoded` → passes.
+(A raw grep for the drive-path literal is unsatisfiable — the guard and the
+docstrings quote it deliberately. FR-3.1 constrains *code*, so the check is
+AST-based.)
 `train/` and `labels/train.csv` exist where `jarvis.sh upload` expects them.
 
 **Risk:** PyDrive2 OAuth opens a browser on first run. Validate the warm path

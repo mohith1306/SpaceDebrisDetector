@@ -12,11 +12,11 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 1 — complete.** Package skeleton, scoped bootstrap, CLI, tests. |
-| Code changes made | **Yes, all inside `tracking_using_drive/`** (Phase 1 code + planning docs). |
+| Active phase | **Phase 2 — complete.** Anonymous Drive sync, allowlist, `gdrive://` resolution, CLI. |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `cli.py`, `tests/test_drive.py`). |
 | Isolation verified | `git status` clean outside the folder; 14/14 library paths scoped under `_data/` |
 | Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
-| Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
+| Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13); Phase 2 needs no credentials (D15). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
 
 ### Goal
 Complete the tracking of debris using the data stored in Google Drive.
@@ -191,6 +191,83 @@ unscoped-import guard firing, and `cli verify` returning 0.
 
 ---
 
+## Phase 2 Record (complete 2026-11-01)
+
+### Delivered
+| File | Role |
+|------|------|
+| `drive.py` | Anonymous-first Drive access, selective allowlist sync, manifest, `DriveError`. |
+| `source.py` | `resolve_source()` with `gdrive://` support; `is_still()` / `is_video()`. |
+| `cli.py` | Added `sync` and `source` subcommands. |
+| `tests/test_drive.py` | 30 tests (2 network-marked, opt-in via `CAPSTONE_NETWORK_TESTS=1`). |
+
+### D15 — anonymous access removes the credential blocker
+The shared folder is **public**. Listing (`embeddedfolderview?id=`) and
+download (`uc?export=download&id=`) both work with no OAuth. Verified live.
+Consequence: Phases 2–4 carry **no credential dependency at all**. OAuth is
+retained only for private folders and for enumeration past the 5,500 listing
+cap (G17). This is a stronger position than the original plan, which assumed
+`credentials.json` was a hard prerequisite.
+
+### Measured facts (live, 2026-11-01)
+| Fact | Value |
+|------|-------|
+| Cold sync of the allowlist | **1,086 files, 171,915,492 bytes (~164 MB)** |
+| Warm sync | **0 network calls**, 1,086 cache hits |
+| `network_calls` accounting | exact: 4 on a 2-file cold sync (2 listings + 2 downloads) |
+| `yolo_dataset/images/val` | **542** stills, all stems in `train.csv` |
+| `train/` listing | capped at **5,500** (indices 1–19,075 of 110,000) — G17 |
+| `train.zip` | **2,456 bytes** — broken placeholder, ignore it — G19 |
+| CSV vs disk extension | CSV says `.png`, disk says `.jpg`; matched on **stem** — G18 |
+| `val.csv` images | **none exist** in the shared folder — G21 |
+
+### Q7 answered for the JarvisLabs path
+`jarvis.sh upload` pushes local `train/` + `labels/`, and `train_jarvis.py`
+sets `CAPSTONE_DIR=ROOT` then rebuilds `yolo_dataset/` **remotely**. So the
+training path needs the **raw** layout, not `yolo_dataset/`. Rebuilding from
+`train/` + `train.csv` is correct; syncing `yolo_dataset/` for training is
+not. (For Phases 3–4, `yolo_dataset/images/val` *is* the right source — 542
+stems, all resolvable against `train.csv` for bboxes.)
+
+### Q8 answered — and it overturns an assumption
+`val.csv` cannot be a synthesis pool. **All 22,000 of its images are absent**
+from the shared folder; every image present (in `train/`, `processed/`, and
+`yolo_dataset/`) has a stem in `train.csv`, none in `val.csv`. `val.csv` is
+annotation-only. Synthesis must draw from `train.csv` stems.
+
+### Two real bugs caught by the tests
+1. **Warm path never triggered.** The manifest is keyed per *file*
+   (`.../val/img000013.jpg`), but `_warm_check` looked up the allowlist entry
+   verbatim (`.../val`) — a directory prefix that is never itself a key. Every
+   warm run silently fell through to a full re-resolve. Fixed with
+   `_expand_entry()`.
+2. **Corruption was blessed permanently.** `_needs_fetch` re-downloaded only
+   when a file was *absent or zero-length*. A size mismatch passed straight
+   through, and `_write_manifest` then recorded the corrupted size — making
+   the damage permanent and invisible. Fixed to compare against the manifest's
+   recorded byte count. Caught by appending one byte to `train.csv` and
+   asserting exactly one re-download.
+
+### A rule conflict, resolved
+`rules.md` demanded `grep -rE "E:/Capstone" tracking_using_drive/` be empty.
+That is **unsatisfiable**: the guard test must contain the literal to check
+for it, and `drive.py` quotes it in a docstring to explain the defect. FR-3.1
+says the literal may not appear in *code*. Reconciled: the check is now
+AST-based (`test_no_hardcoded_drive_path`), ignoring docstrings. Updated in
+`rules.md`, `phases.md`, and `requirements.md` §8.
+
+### Test results
+```
+30 passed in 15.60s        # incl. 2 live-network tests
+```
+Offline: listing parser against recorded HTML, HTML-interstitial detection,
+`_expand_entry`, allowlist smallness, no hardcoded path in code, camera-index
+round-trip, still/video classification, empty-dir failure, warm cache zero
+calls, `--no-sync` on empty cache, unknown path, report metadata.
+Network (opt-in): live folder listing, live CSV download and header check.
+
+---
+
 ## JarvisLabs Training Flow (D14)
 
 The repo is already provisioned for GPU training off-box. What the branch must
@@ -259,6 +336,7 @@ needs the JarvisLabs run.
 | **D12** | **2026-11-01** | **Occlusion is implemented by erasing the object region, not translating it off-canvas.** | Off-canvas translation can leave the object detectable depending on padding. Erasure guarantees a true dropout, which is the only way to test D4/FR-4.1. |
 | **D13** | **2026-11-01** | **Validate the tracking layer in isolation by injecting synthesised detections at known centres, decoupling it from the detector.** `sequence.py` already knows the exact object position per frame, so it can emit a detection stream directly. | No weights are reachable from the share. This unblocks Phases 3–5 immediately, and isolates precisely the layer this branch fixes — missed-detection propagation and track continuity. Complements D14 rather than replacing it: real weights still matter for the full detection→tracking path. |
 | **D14** | **2026-11-01** | **Training runs on JarvisLabs GPU, not locally. Local torch stays CPU-only.** | Stated by the project owner. The repo is already provisioned for this: `train_jarvis.py` (rebuild pipeline + train), `scripts/jarvis.sh` (instance lifecycle), `requirements-gpu.txt` (no torch pin — the pytorch template supplies CUDA builds). Local CPU is used only for inference and validation. |
+| **D15** | **2026-11-01** | **Phase 2 Drive access is anonymous-first; OAuth is an optional fallback, not a prerequisite.** | Verified directly: the shared `Capstone` folder is public, so listing (`embeddedfolderview`) and download (`uc?export=download`) both succeed with no credentials. This removes the `credentials.json` blocker from Phases 2–4 entirely. `GDriveSync`/OAuth is retained only for private folders and for enumeration beyond the public listing cap (G17). |
 
 ---
 
@@ -331,6 +409,11 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G14 | `space_debris.config.verify_paths()` prints U+2713/U+2717 (`✓`/`✗`). | The Windows console default is **cp1252**, which cannot encode those glyphs — calling it raises `UnicodeEncodeError`. Use `data_presence()` from `tracking_using_drive.config`, which returns a dict and prints nothing. |
 | G15 | `space_debris.config` prints `Using device: cpu` on import. | An unavoidable library side effect (R0). It appears above our banner. Suppressed stdout could hide real warnings, so it is left visible. |
 | G16 | Running pytest from the repo root creates `.pytest_cache/` there. | Gitignored by the upstream `.gitignore`, so it is not an R0 violation — but remove it rather than let it accumulate. Run with `-p no:cacheprovider` to avoid it entirely. |
+| G17 | The public Drive listing endpoint (`embeddedfolderview`) **caps at 5,500 entries per folder** and ignores `page=`. | `train/` holds far more (CSV references indices up to 110,000) but only the first 5,500 are enumerable anonymously. A full 66k anonymous sync is therefore **impossible** — it needs OAuth. A small allowlisted slice is unaffected. |
+| G18 | `train.csv` names **`.png`**; the Drive folders hold **`.jpg`**. | Not a bug: `convert_labels.py:73` and `:80` join on `Path(csv_name).stem` and probe both extensions. Matching is by stem, so the mismatch is tolerated by design. Never "fix" it. |
+| G19 | `train.zip` in the shared folder is **2,456 bytes** — an empty/corrupt placeholder. | Cannot be used as a data source; `jarvis.sh` does not reference it either. Ignore it. |
+| G20 | `yolo_dataset/images/val` is only **542 images**, and all its stems are in **train.csv**, not `val.csv`. | The Drive `yolo_dataset` was built by `split_dataset.py` (seed 42, 90/10) from the 2,000 preprocessed images — a split of `train/`, unrelated to `val.csv`'s 22k. Never assume `images/val` corresponds to `val.csv`. |
+| G21 | **All 22,000 `val.csv` images are absent from the shared folder.** `train/`, `processed/`, and `yolo_dataset/` contain only `train.csv` stems (verified: 0 `val.csv` stems anywhere). | `val.csv` is annotation-only. It cannot be used as a synthesis pool (Q8) — there are no images behind it. Synthesis must draw from `train.csv` stems. |
 
 ---
 
@@ -411,7 +494,6 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - **No runtime code changed.**
 - **Pushed** `d1ddc75`, `d3f4604`, `4494973` to `origin/tracking_using_drive`
   on request.
-
 ### 2026-11-01 — Phase 1: package skeleton and bootstrap
 - **Wrote the Phase 1 code**, all inside `tracking_using_drive/`:
   `__init__.py`, `config.py`, `cli.py`, `main.py`, `tests/test_config.py`,
@@ -440,21 +522,61 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - `python -m tracking_using_drive.main status` reports all 14 library paths
   scoped under `tracking_using_drive/_data/`. `verify` exits 0.
 
+### 2026-11-01 — Phase 2: Drive access and local staging
+- **Pushed Phase 1** (`11b1405`) to `origin/tracking_using_drive`.
+- **Read all four Phase 2 dependencies**: `gdrive_sync.py`, `jarvis.sh`,
+  `train_jarvis.py`, root `.gitignore`, `space_debris/config.py`,
+  `rules.md`, `design.md`.
+- **D15 established: the shared folder is public.** Listing and download both
+  succeed anonymously. Probed with five scripts before writing any production
+  code — this finding removed the `credentials.json` blocker from Phases 2–4.
+- **Reconciled four data contradictions** (all recorded as G17–G21): the
+  5,500 listing cap; `.png` in CSV vs `.jpg` on disk (matched on stem, not a
+  bug); the broken 2,456-byte `train.zip`; and the absence of all 22,000
+  `val.csv` images.
+- **Wrote `drive.py`** — anonymous-first sync, allowlist, manifest, warm path,
+  transport-level network counter, `DriveError`.
+- **Wrote `source.py`** — `resolve_source()` with `gdrive://`, plus
+  `is_still()`/`is_video()` for the still-vs-sequence routing decision.
+- **Extended `cli.py`** with `sync` and `source`.
+- **Two real bugs caught by tests and fixed:**
+  1. warm path never triggered — manifest keyed per file, looked up per
+     directory prefix;
+  2. size-mismatch corruption was permanently blessed by the next manifest
+     write.
+- **Resolved an unsatisfiable rule** (raw grep for the drive-path literal)
+  by moving the check to AST and updating `rules.md`, `phases.md`,
+  `requirements.md` §8.
+- **30/30 tests pass**, including 2 live-network tests (opt-in via
+  `CAPSTONE_NETWORK_TESTS=1`).
+- Cold sync measured at **1,086 files / ~164 MB**; warm sync at **0 network
+  calls**. Both recorded above.
+- **Phase 2's JarvisLabs staging half is deliberately deferred** — it needs an
+  R0 decision (see Next Actions 3), and only Phase 5 consumes it.
+
 ---
 
 ## Next Actions
 
-1. **Phase 2 — Drive access and local staging.** Deterministic credentials,
-   selective sync allowlist, `gdrive://` resolution, **and** the local
-   `train/` + `labels/train.csv` layout `jarvis.sh upload` expects (G12).
-2. **Phase 3 — sequence synthesis.** Unblocked and weight-free.
-3. Resolve Q7 (which subfolder to sync) during Phase 2 design — decide between
-   syncing `yolo_dataset/` directly and rebuilding it from `train/` +
-   `train.csv`. The answer determines the sync allowlist's size.
-4. Commit and push the Phase 1 code before starting Phase 2, so the invariant
-   guards are in version control ahead of the code that depends on them.
-5. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
+1. **Phase 3 — sequence synthesis.** `sequence.py`: `Motion`, `Occlusion`,
+   `GroundTruth`, occlusion-by-erasure (D12). Unblocked and weight-free; the
+   542 cached stills are ready as input.
+2. **Phase 4 — tracking correctness.** `stream.py` reimplemented with the
+   missed-detection propagation fix and the **D13 injection path**, which
+   needs no weights.
+3. **Decide the JarvisLabs staging layout** (only matters for Phase 5). Two
+   options, both R0-compatible since `train/` and `labels/` are gitignored
+   upstream:
+   - (a) `stage` writes real dirs at the repo root where `jarvis.sh upload`
+     expects them, with `unstage` to remove them.
+   - (b) `stage` keeps the bytes in `_data/` and creates repo-root
+     **junctions**. Cleaner R0 story, but the repo lives inside **OneDrive**,
+     and junctions under OneDrive are unreliable — likely not worth it.
+   Leaning (a) with an explicit warning print, but this touches R0 (the
+   controlling rule), so confirm before implementing.
+4. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
    it is the sole optional phase.
 
-The scope is locked (D8) and no gate remains. Phases 2–4 and 6–7 need no
-external credentials or GPU budget.
+The scope is locked (D8) and no gate remains. Phases 3–4 and 6–7 need no
+external credentials, no GPU budget, and — since D15 — no Drive credentials
+either.
