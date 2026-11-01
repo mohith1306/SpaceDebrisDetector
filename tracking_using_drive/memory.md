@@ -12,10 +12,10 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 0 — Baseline and Data Verification** (not started) |
-| Code changes made | **None.** Planning docs only. |
-| Baseline recorded | No |
-| Blocking question | **RESOLVED 2026-11-01** — Option A confirmed. Scope is locked. |
+| Active phase | **Phase 0 — Baseline and Data Verification** (partially complete) |
+| Code changes made | **None.** Planning docs only, committed as `d1ddc75`. |
+| Baseline recorded | **No — BLOCKED on model weights** (see §Environment) |
+| Blocking question | Scope gate **RESOLVED** (Option A). A new blocker appeared: no weights. |
 
 ### Goal
 Complete the tracking of debris using the data stored in Google Drive.
@@ -78,6 +78,59 @@ says so in its docstring.
 
 ---
 
+## Environment (audited 2026-11-01)
+
+Local machine, `C:\Users\naras\OneDrive\Desktop\Capstone\SpaceDebrisDetector`:
+
+| Item | Value | Consequence |
+|------|-------|-------------|
+| Python | 3.12.2 | OK |
+| torch | **2.7.1+cpu** | CPU only. No CUDA, no MPS. |
+| ultralytics | **MISSING** | Cannot run YOLO at all yet. |
+| pydrive2 | **MISSING** | Cannot do Drive sync yet. |
+| cv2 / numpy / pandas | 4.11.0 / 2.0.1 / 2.2.2 | Present. |
+| Data locally | **none** | No `train/`, `labels/`, `processed/`, `yolo_dataset/`. |
+| Weights locally | **none** | No `.pt` anywhere in the repo. |
+
+Git identity had to be set locally (`user.name = "naras"`) — `user.email` was
+already configured. Change it if a different name is wanted.
+
+### The weights blocker
+
+**No trained detector weights are reachable.** Verified:
+
+- Not in the repo — no `.pt` anywhere (gitignored upstream).
+- Not in the shared Drive folder — the `Capstone` listing has 10 top-level
+  items (`train/`, `processed/`, `labels/`, `labels_yolo_2k/`,
+  `yolo_dataset/`, `space_debris.yaml`, `train.zip`, two notebooks,
+  `.ipynb_checkpoints/`) and **no `runs/` or `model_checkpoints/` folder**.
+- The notebook `CAPSTONE.ipynb` shows they were trained in **Google Colab**
+  and written to the author's **private MyDrive**:
+  ```
+  /content/drive/MyDrive/Capstone/runs/detect/weights/best.pt
+  /content/drive/MyDrive/Capstone/runs/detect/weights/last.pt
+  /content/drive/MyDrive/Capstone/model_checkpoints
+  ```
+  `MyDrive/Capstone` is the author's own drive, **not** the shared folder.
+  They were never uploaded to the share.
+
+Consequence: nothing in Phases 0, 3, 4, 5 that requires *detections* can run
+until weights are obtained or the tracking layer is validated without them.
+See **D13** for the proposed workaround.
+
+### Phase 0 task status
+
+| Task | Status |
+|------|--------|
+| Environment audit | ✅ Done |
+| Verify Drive CSV facts locally | ✅ Done (66k/22k, 1 annot each, zero overlap) |
+| Confirm R0 isolation | ✅ Done — `git status` clean outside the folder |
+| Baseline `stream` run | ❌ Blocked — no weights, no data, no ultralytics |
+| Reproduce degenerate case | ❌ Blocked — same |
+| `make_demo_video.py` run | ❌ Blocked — needs a local image |
+
+---
+
 ## Decisions
 
 | # | Date | Decision | Rationale |
@@ -94,6 +147,7 @@ says so in its docstring.
 | D10 | 2026-11-01 | Set `CAPSTONE_DIR` **before** importing `space_debris.config`, scoping its paths under `tracking_using_drive/_data/`. | `config.py:19-20` reads the env at import and `:117-118` creates dirs at import. Cannot edit either; must control via environment. |
 | D11 | 2026-11-01 | Selective sync via allowlist, not whole-folder. | Folder holds `train/`, `processed/`, `yolo_dataset/` — three overlapping copies totalling 88k images. A tracking run needs a slice. |
 | **D12** | **2026-11-01** | **Occlusion is implemented by erasing the object region, not translating it off-canvas.** | Off-canvas translation can leave the object detectable depending on padding. Erasure guarantees a true dropout, which is the only way to test D4/FR-4.1. |
+| **D13** | **2026-11-01 (PROPOSED)** | **Validate the tracking layer in isolation by injecting synthesised detections at known centres, decoupling it from the detector.** `sequence.py` already knows the exact object position per frame, so it can emit a detection stream directly. | No weights are reachable (see §Environment). This unblocks Phases 3–5 entirely, and isolates precisely the layer this branch fixes — missed-detection propagation and track continuity. Detection accuracy becomes a separate, later concern. **Needs user confirmation.** |
 
 ---
 
@@ -214,6 +268,16 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - **Q6 confirmed with the project owner: Option A — validate on synthetic
   sequences.** Scope locked; D8 upgraded from assumption to decision. No gate
   remains before Phase 3.
+- **Committed the planning set** as `d1ddc75` (7 files, 1,661 insertions),
+  plus `tracking_using_drive/.gitignore` guarding `_data/`, `credentials.json`,
+  and weights. Set local `user.name = "naras"` (was unset).
+- **Phase 0 environment audit.** Python 3.12.2, torch **CPU-only**
+  (2.7.1+cpu), cv2/numpy/pandas present, **`ultralytics` and `pydrive2`
+  missing**. No data and no weights locally.
+- **Traced the weights.** `CAPSTONE.ipynb` shows models were trained in Google
+  Colab and written to the author's **private** `MyDrive/Capstone/runs/`, which
+  is not the shared folder. **No weights are reachable.** Raised **D13**
+  (proposed) to validate the tracking layer via injected detections instead.
 - **No runtime code changed.**
 
 ---
