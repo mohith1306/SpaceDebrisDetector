@@ -26,9 +26,9 @@ roadmap (see tracking_using_drive/phases.md):
   sync          selective Google Drive sync                  [Phase 2 - now]
   source        resolve a source (incl. gdrive://)           [Phase 2 - now]
   synth         still -> synthetic sequence + ground truth   [Phase 3 - now]
-  track         detect + track, with missed-detection fix    [Phase 4]
-  stream        full pipeline: track -> classify -> orbit    [Phase 4]
-  orbit         offline orbit report from a track JSONL      [Phase 4]
+  stream        detect + track, with missed-detection fix    [Phase 4 - now]
+  orbit         offline orbit report from a track JSONL      [Phase 4 - now]
+  track         detect + track (library stage, unmodified)   [Phase 4 - now]
 """
 
 
@@ -366,6 +366,168 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stream(args: argparse.Namespace) -> int:
+    """Run detect -> track -> classify -> orbit, or the D13 injected path.
+
+    With ``--ground-truth`` no weights are loaded: fps, FOV and the detection
+    stream all come from a Phase 3 ``ground_truth.json``, so the tracking layer
+    is exercised on its own (D13). Without it the real detector runs.
+    """
+    from .drive import DriveError
+    from .sequence import GroundTruth, detections_from_ground_truth
+    from .source import resolve_source
+
+    injected = args.ground_truth is not None
+
+    gt = None
+    fps = args.fps
+    fov_deg = args.fov
+    detections = None
+    if injected:
+        try:
+            gt = GroundTruth.load(Path(args.ground_truth))
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"ERROR: cannot read ground truth: {exc}", file=sys.stderr)
+            return 2
+        # Truth and estimate must share fps/FOV, or R9 would be measuring an
+        # argument mismatch rather than tracking error.
+        fps = gt.fps
+        fov_deg = gt.fov_deg
+        if args.source is None:
+            args.source = gt.frame_dir
+        if args.source is None:
+            print("ERROR: ground truth has no frame_dir; pass --source",
+                  file=sys.stderr)
+            return 2
+        detections = detections_from_ground_truth(gt)
+
+    try:
+        resolved = resolve_source(args.source, no_sync=args.no_sync)
+    except (DriveError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if isinstance(resolved, int):
+        if injected:
+            print("ERROR: injected detections cannot drive a camera index",
+                  file=sys.stderr)
+            return 2
+        print(f"ERROR: camera sources are not supported yet: {resolved}",
+              file=sys.stderr)
+        return 2
+
+    from .stream import run_stream
+
+    try:
+        summary = run_stream(
+            source=str(resolved),
+            detections=detections,
+            fps=fps,
+            fov_deg=fov_deg,
+            range_km=args.range_km,
+            orbit=not args.no_orbit,
+            out_jsonl=args.out,
+            orbit_report_path=args.orbit_report,
+            annotate_path=args.annotate,
+            max_frames=args.max_frames,
+            max_missed=args.max_missed,
+            model_path=args.model,
+            conf=args.conf,
+            tracker=None if args.no_tracker else args.tracker,
+            classifier_path=args.classifier,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    print(f"Stream ({summary['detection_source']}"
+          f"{', SYNTHETIC' if summary['synthetic'] else ''})")
+    print(f"  source          {summary['source']}")
+    print(f"  frames          {summary['frames']}")
+    print(f"  fps assumed     {summary['fps_assumed']}")
+    print(f"  detections      {summary['detections']}")
+    print(f"  tracks          {summary['num_tracks']} "
+          f"(expired {summary['expired_tracks']})")
+    print(f"  missed frames   {summary['missed_frames_total']}")
+    if summary["tracks"]:
+        for t in summary["tracks"]:
+            print(f"    #{t['track_id']}: obs={t['observations']} "
+                  f"missed={t['n_missed']} lifespan={t['lifespan_s']}s "
+                  f"expired={t['expired']}")
+    print(f"  orbit tracks    {summary['orbit_tracks']}")
+    if summary["orbit_report"]:
+        print(f"  orbit report    {summary['orbit_report']}")
+    if summary["jsonl"]:
+        print(f"  jsonl           {summary['jsonl']}")
+    if summary["synthetic"]:
+        print("  synthetic       True  <- validation run, not a measured "
+              "debris orbit (R7)")
+    return 0
+
+
+def _cmd_orbit(args: argparse.Namespace) -> int:
+    """Offline orbit report from a track JSONL (library stage, unmodified)."""
+    from space_debris.utils.orbit import orbit_from_jsonl
+
+    try:
+        result = orbit_from_jsonl(
+            args.jsonl, fov_deg=args.fov, range_km=args.range_km,
+            out_json=args.out,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print(f"Orbit from {args.jsonl}")
+    print(f"  frames      {result['frames']}")
+    print(f"  image size  {result['image_size']}")
+    print(f"  tracks      {result['tracks']}")
+    for entry in result["report"]:
+        traj = entry["trajectory"]
+        rate = traj.get("angular_rate_deg_s")
+        print(f"    #{entry['track_id']}: n={traj.get('n_points')} "
+              f"rate={rate} missing={traj.get('missing')}")
+    if args.out:
+        print(f"  written     {args.out}")
+    return 0
+
+
+def _cmd_track(args: argparse.Namespace) -> int:
+    """Run the library's track stage unmodified (R0: read, never write).
+
+    Exposed rather than reimplemented so the JSONL it produces can be compared
+    against ours — ``orbit`` then reads either file unchanged.
+    """
+    from space_debris.models.track import track as library_track
+
+    try:
+        summary = library_track(
+            model_path=args.model, source=args.source, conf=args.conf,
+            tracker=args.tracker, max_frames=args.max_frames, fps=args.fps,
+            out_jsonl=args.out,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    print(f"Track ({summary['source']})")
+    for key in ("frames", "fps_assumed", "num_tracks", "tracker", "jsonl"):
+        print(f"  {key:14s} {summary.get(key)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tracking_using_drive",
@@ -470,6 +632,72 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_synth.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     p_synth.set_defaults(func=_cmd_synth)
+
+    p_stream = sub.add_parser(
+        "stream",
+        help="run detect -> track -> classify -> orbit, or the D13 injected path",
+    )
+    p_stream.add_argument(
+        "source", nargs="?", default=None,
+        help="frames directory, video, or gdrive://subpath "
+             "(default: the frame dir named by --ground-truth)",
+    )
+    p_stream.add_argument(
+        "--ground-truth", default=None,
+        help="Phase 3 ground_truth.json: use its fps/FOV and inject its "
+             "detections instead of a detector (D13 — needs no weights)",
+    )
+    p_stream.add_argument("--out", default=None, help="per-frame JSONL output")
+    p_stream.add_argument("--orbit-report", default=None, help="per-track orbit JSON")
+    p_stream.add_argument("--annotate", default=None, help="annotated video output")
+    p_stream.add_argument("--max-frames", type=int, default=None)
+    p_stream.add_argument(
+        "--max-missed", type=int, default=30,
+        help="consecutive absent frames before a track expires (default 30)",
+    )
+    p_stream.add_argument("--fov", type=float, default=60.0, help="horizontal FOV (deg)")
+    p_stream.add_argument("--range-km", type=float, default=None,
+                          help="observer-to-object range; omit to leave speed null")
+    p_stream.add_argument("--fps", type=float, default=None,
+                          help="frame rate (required for correct deg/s; "
+                               "--ground-truth supplies it)")
+    p_stream.add_argument("--model", default=None, help="weights path")
+    p_stream.add_argument("--conf", type=float, default=0.25)
+    p_stream.add_argument("--tracker", default="bytetrack.yaml")
+    p_stream.add_argument("--no-tracker", action="store_true",
+                          help="run predict() instead of track() (no association)")
+    p_stream.add_argument("--classifier", default=None,
+                          help="second-stage classifier weights")
+    p_stream.add_argument("--no-orbit", action="store_true")
+    p_stream.add_argument("--no-sync", action="store_true",
+                          help="resolve gdrive:// from the warm cache only")
+    p_stream.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_stream.set_defaults(func=_cmd_stream)
+
+    p_orbit = sub.add_parser(
+        "orbit",
+        help="offline orbit report from an existing track JSONL",
+    )
+    p_orbit.add_argument("jsonl", help="JSONL produced by `stream --out`")
+    p_orbit.add_argument("--fov", type=float, default=60.0)
+    p_orbit.add_argument("--range-km", type=float, default=None)
+    p_orbit.add_argument("--out", default=None, help="orbit JSON to write")
+    p_orbit.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_orbit.set_defaults(func=_cmd_orbit)
+
+    p_track = sub.add_parser(
+        "track",
+        help="library track stage (unmodified space_debris.models.track)",
+    )
+    p_track.add_argument("source", nargs="?", default=None)
+    p_track.add_argument("--model", default=None)
+    p_track.add_argument("--conf", type=float, default=0.25)
+    p_track.add_argument("--tracker", default="bytetrack.yaml")
+    p_track.add_argument("--max-frames", type=int, default=None)
+    p_track.add_argument("--fps", type=float, default=None)
+    p_track.add_argument("--out", default=None, help="per-frame JSONL output")
+    p_track.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_track.set_defaults(func=_cmd_track)
 
     return parser
 

@@ -12,9 +12,9 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 3 — core complete.** `sequence.py` synthesis, erasure occlusion, D13 injection, `synth` CLI with batch mode. End-to-end tracking exit criterion is Phase 4's. |
-| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `cli.py`, `tests/test_drive.py`, `tests/test_sequence.py`). |
-| Isolation verified | `git status` clean outside the folder; 68/68 tests pass, 0 skipped |
+| Active phase | **Phase 4 — complete.** `stream.py` predict-then-correct engine, D13 injection, `stream`/`orbit`/`track` CLI. All exit criteria measured. Next: Phase 6 (end-to-end validation). |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `stream.py`, `cli.py`, `tests/test_drive.py`, `tests/test_sequence.py`, `tests/test_stream.py`). |
+| Isolation verified | `git status` clean outside the folder; 112/112 tests pass, 0 skipped |
 | Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
 | Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13); Phase 2 needs no credentials (D15). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
 
@@ -275,7 +275,7 @@ Network (opt-in): live folder listing, live CSV download and header check.
 |------|----------|
 | `sequence.py` | `Motion`, `Occlusion`, `GroundTruth`; `synthesise_sequence`, `detections_from_ground_truth` (D13), label/centre/rate helpers |
 | `cli.py` | `synth` subcommand — single sequence, occlusion flags, `--video`, `--count N` batch, `--json` |
-| `tests/test_sequence.py` | 34 tests |
+| `tests/test_sequence.py` | 38 tests |
 
 `sequence.py` is the branch's core addition: the dataset is 88k *independent*
 stills, so ByteTrack sees a track of length 1, nothing reaches
@@ -364,12 +364,130 @@ one sequence gives one number with no spread — which cannot separate a real
 ```
 68 passed in 26.11s        # 0 skipped
 ```
-`test_config.py` 11, `test_drive.py` 19, `test_sequence.py` 34 (2 live-network
+`test_config.py` 11, `test_drive.py` 19, `test_sequence.py` 38 (2 live-network
 tests in `test_drive.py` still gated by `CAPSTONE_NETWORK_TESTS=1`).
 
 Two test bugs were mine, not the code's: a fixture that copied an image but
 not its label (so discovery correctly found nothing), and asserting equality
 between a tuple and a JSON-round-tripped list.
+
+---
+
+## Phase 4 Record (complete 2026-11-01)
+
+### Delivered
+| File | Contents |
+|------|----------|
+| `stream.py` | `TrackerEngine`, `assign_track_ids`, `iter_frames`, `run_stream` — the reimplemented pipeline with missed-detection propagation |
+| `cli.py` | `stream`, `orbit`, `track` subcommands added |
+| `tests/test_stream.py` | 44 tests |
+
+All four exit criteria met on the Phase 3 occlusion fixture (30 frames,
+gap 10–19, injected):
+
+| criterion | measured |
+|---|---|
+| id preserved across the gap | **1** distinct id, before and after |
+| predicted, not frozen | `predicted_track_ids == [1]` on all 10 gap frames; `motion` resumes 0.032763 vs 0.032616 pre-gap |
+| appears once in orbit report | `orbit_tracks = 1`, ids `[1]` |
+| `n_missed` recorded | **10** (exactly the gap) |
+| angular rate vs truth | `[1.75779, -0.87886]` vs `[1.75781, -0.87891]` → **0.0013%** (R9: 10%) |
+
+### The core design decision: predict-then-correct, not miss-then-update
+`ConstantVelocityFilter.update` (`orbit.py:47-60`) **predicts with `dt` and
+then corrects**, and `TrajectoryBank.update` derives `dt` from the last
+**observation** timestamp — but `miss()` does not append to history. The
+obvious implementation (call `miss()` per gap frame, then `update()` at
+re-acquisition) therefore advances the filter once per missed frame *and* once
+more for the whole gap: 10 + 11 = 21 frames of prediction for 11 elapsed.
+
+Measured consequence (10-frame gap, true velocity 0.06 units/frame):
+
+| | velocity at re-acquisition | error |
+|---|---|---|
+| naive `miss()` ×10 + `update(dt=11)` | 0.024737 | **-58.77%** |
+| `predict()` ×11 + `update(dt=0.0)` | 0.067980 | +13.30% |
+
+Note the *direction*: the naive form **deflates** velocity rather than
+inflating it — it over-predicts position (21 frames of advance for 11
+elapsed), and the position correction then drags the velocity estimate down to
+compensate. The damage lands on `motion.speed_norm_s`, exactly the field a
+"did it predict or freeze?" check reads. I wrote the opposite claim in the
+docstring first and corrected it after measuring. Pinned by
+`test_naive_miss_plus_update_would_corrupt_velocity`.
+
+So each frame advances **every** active track exactly once (`predict()`), then
+corrects only the observed ones with `dt=0.0`. That invariant — every active
+track advances exactly once per frame — is what makes the exit criterion
+answerable at all.
+
+### Non-vacuity: proving the assertion can fail
+"ID preserved across the gap" is vacuous if the id is a constant. The
+association gate is `GATE_SCALE(4.0) × observed per-frame step` (floor
+`GATE_FLOOR_PX(8.0)`), matched against each track's **predicted** position.
+With prediction working → id `[1]` preserved. With prediction frozen → the
+re-appearing object sits ~67 px away, outside the ~27 px gate, and the track
+**splits into `[1, 2]`**. So criterion 1 is a real assertion, not a tautology.
+
+### Expiry is terminal
+Tracks missing more than `max_missed` consecutive frames expire: they stop
+advancing, are never resurrected, and are excluded from the orbit report — but
+history is retained (the bank is never pruned) and they remain visible in the
+`tracks` inventory, otherwise "we dropped 3 tracks" would be unrecoverable
+from the outputs. `lifespan_s` = first→last **observation**; the missing tail
+does not extend it.
+
+The `max_missed` boundary, measured both sides:
+
+| `max_missed` | tracks | expired | orbit entries |
+|---|---|---|---|
+| 30 (default) | 1 | 0 | 1 |
+| 3 | **2** | 1 | 1 |
+
+With a tight budget the gap **splits** the object: track 1 expires, the object
+returns as track 2 with 10 fresh observations — not expired, not too short, so
+it still ships one orbit entry. `test_cli_stream_honours_max_missed` asserts
+`orbit_tracks == 1` (not `0`) for exactly this reason; the default-30 case is
+pinned alongside it so the parameter's effect cannot drift unnoticed.
+
+### Defects found in the original (all verified, not assumed)
+1. **`TrajectoryBank.miss()` is never called anywhere** — occluded objects
+   freeze, then fragment on re-acquisition, and both fragments fall below
+   `MIN_POINTS_FOR_ORBIT = 3`. Silent, no error raised.
+2. **`width`/`height` taken from the *last* frame** (`stream.py:181`) —
+   harmless for fixed-size video, wrong geometry for mixed-size stills.
+   *Correction:* `phases.md` originally called this an unbound-variable crash
+   on an empty source. **Not reachable** — the report block is guarded by
+   `bank.ids()`, which is only truthy if the loop ran and bound `width`.
+   Verified by replicating the original control flow; the real defect is
+   last-vs-first frame.
+3. **Records omit `cx`/`cy`** while `orbit_from_jsonl` (`orbit.py:294`) reads
+   them unconditionally — confirmed: the original's own JSONL raises
+   `KeyError: 'cx'` and cannot be replayed through the library's offline
+   stage. Ours replays cleanly.
+4. **`_to_record` only understood `detector_class`**, while the injected stream
+   from `sequence.py` carries `class_name` — every injected detection fused to
+   `None` and counted as `unknown`. The run "worked", it just reported the
+   wrong taxonomy. Caught by the first test run; fixed to accept both keys.
+
+### Gotchas found while building it
+- **G25** — `space_debris.config` prints `Using device: cpu` on import (already
+  G15). It prefixes `stream --json` stdout, so parsing CLI output needs
+  `capsys` in tests or `txt[txt.find('{'):]` in a subprocess. Hit twice.
+- **G26** — injected detections carry `class_name`, model detections carry
+  `detector_class`. Any consumer of both paths must read both keys.
+
+### Test results
+```
+112 passed in 37.47s        # 0 skipped
+```
+`test_config` 11, `test_drive` 19, `test_sequence` 38, `test_stream` 44
+(2 live-network tests in `test_drive.py` gated by `CAPSTONE_NETWORK_TESTS=1`).
+
+Six failures on the first run: four were test bugs of mine (wrong ground-truth
+path, empty-dir hitting a Phase 2 guard, an `n_missed` count that stops at
+expiry, an error-message regex), one was the real `class_name` fusion defect
+above, and one was the `max_missed` expectation corrected just now.
 
 ---
 
@@ -522,6 +640,8 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G22 | The sibling-label convention is `.../images/<split>/<img>.jpg` → `.../labels/<split>/<img>.txt`, so the check is `image.parent.parent.name == "images"` — **not** `image.parent.name`. | The image's parent is the *split* (`val`), not `images`. Getting this wrong silently skips label discovery, and the symptom surfaces later as "occlusion requires a bounding box". |
 | G23 | `occluded_frames` on `GroundTruth` is a derived `@property` and is deliberately **not** written to JSON. | The gap is stored once as the `occlusion` object. Serialising both would let a hand-edited file make them disagree, and scoring would then use a different gap than was rendered. |
 | G24 | `GroundTruth.load()` returns **lists**, not tuples, for `centres` / `start_centre` / `bbox_norm`. | JSON has no tuple type. Tests comparing `== (0.5, 0.5)` against a loaded value fail even when the data is correct — compare with `pytest.approx` or `tuple(...)`. |
+| G25 | `space_debris.config` prints `Using device: cpu` to stdout on import (see G15), which **prefixes any `--json` CLI output**. | `json.loads(stdout)` raises `JSONDecodeError: Expecting value: line 1 column 1`. In tests use `capsys`; in a subprocess slice from `txt.find('{')`. Hit twice — once in a test, once in a verification script. |
+| G26 | Injected detections carry `class_name`; model detections carry `detector_class`. | `_to_record` originally read only `detector_class`, so every injected detection fused to `None` and was counted as `unknown` — the run succeeded while reporting the wrong taxonomy. Any consumer of both paths must read both keys. |
 
 ---
 
@@ -684,23 +804,67 @@ the isolation constraint is ever lifted, these are worth upstreaming:
   `--occlude-*` flags and `validate_angular_rate.py` became a test. Recorded in
   `phases.md` so the plan and the code agree.
 - **68/68 tests pass, 0 skipped** (`test_config` 11, `test_drive` 19,
-  `test_sequence` 34).
+  `test_sequence` 38).
 - Three mistakes were mine and are now fixed: an `import os` left unused; a
   label-discovery check testing the wrong directory level (G22); and two test
   assertions written against the wrong types (a fixture that copied an image but
   not its label; a tuple compared to a JSON-round-tripped list).
 
+### 2026-11-01 — Phase 4: tracking correctness
+- **Read the library first** — `models/stream.py`, `utils/orbit.py`,
+  `models/track.py`, `models/classify.py` — which surfaced the
+  predict-then-correct timing trap before any code was written. `update()`
+  predicts with `dt`; `miss()` doesn't append to history; the naive pairing
+  double-counts a gap.
+- **Measured the trap rather than trusting the reasoning.** My docstring first
+  claimed the naive form *inflates* velocity; measurement showed it **deflates**
+  it (−58.77% vs +13.30%) because over-predicted position drags velocity down
+  during correction. Corrected the docstring and pinned the number in
+  `test_naive_miss_plus_update_would_corrupt_velocity`.
+- **Wrote `stream.py`** — `TrackerEngine` (predict → observe → end_frame),
+  `assign_track_ids` (nearest-neighbour against *predicted* positions),
+  `iter_frames`, `run_stream` with the D13 `detections=` injection path.
+- **Proved the exit criterion is non-vacuous**: with prediction working the id
+  survives (`[1]`); with prediction frozen the track splits (`[1, 2]`). A
+  constant-id injection would have "passed" either way.
+- **All four Phase 4 exit criteria measured green** on the Phase 3 fixture —
+  id preserved, `predicted_track_ids == [1]` on all 10 gap frames, one orbit
+  entry, `n_missed == 10`, rate error **0.0013%**.
+- **Corrected an inherited claim**: the `stream.py:181` unbound-variable bug
+  is *not reachable* (verified by replicating the original control flow — the
+  report is guarded by `bank.ids()`). The real defect is last-frame-vs-first
+  geometry. `phases.md` and the docstring now say so.
+- **Found a real defect in my own code**: `_to_record` read only
+  `detector_class` while injected detections carry `class_name`, so every
+  injected detection fused to `None` and counted as `unknown` (G26).
+- **Added `stream`/`orbit`/`track` CLI subcommands**; smoke chain
+  `synth → stream --ground-truth → orbit` exits 0, and the library's
+  `orbit_from_jsonl` replays our JSONL (the original's raises `KeyError: 'cx'`,
+  confirmed by direct experiment).
+- **The `max_missed` split**: `--max-missed 3` over a 10-frame gap yields
+  `tracks == 2, expired == 1, orbit_tracks == 1` — track 1 expires, the object
+  returns as track 2. Corrected my test's wrong expectation (`orbit_tracks == 0`)
+  and pinned the contrasting `--max-missed 30` case alongside it.
+- **112/112 tests pass, 0 skipped** (`test_config` 11, `test_drive` 19,
+  `test_sequence` 38, `test_stream` 44).
+- Doc corrections made in the same pass: `test_sequence` count was recorded as
+  34 in four places (it is 38 — the batch tests were added after the first
+  count), and `requirements.md`/`design.md`/`architecture.md` still referenced
+  the out-of-bounds `scripts/` deliverables.
+
 ---
 
 ## Next Actions
 
-1. **Phase 4 — tracking correctness.** `stream.py` reimplemented with the
-   missed-detection propagation fix, the `frame_wh` first-frame fix,
-   `--max-missed`, and the **D13 injection path** (needs no weights). This is
-   also where Phase 3's remaining exit criterion — tracked end-to-end rate
-   recovery within 10% — gets measured.
-2. **Decide the JarvisLabs staging layout** (only matters for Phase 5). Two
-   options, both R0-compatible since `train/` and `labels/` are gitignored
+1. **Phase 6 — end-to-end validation.** The chain already smoke-tested
+   (`synth → stream → orbit`); Phase 6 formalises it: sweep `--fov` and
+   `--range-km`, confirm `speed_km_s` stays null without a range, check
+   track-continuity metrics against the Phase 0 baseline, and verify every
+   synthetic artifact carries `synthetic: true` (R7).
+2. **Phase 7 — hardening.** Pre-commit checklist, no artifacts committed,
+   re-run Phase 0/3/4 validations, close `requirements.md` §8, final PR.
+3. **Phase 5 (optional) — JarvisLabs staging decision** when Q9 is answered.
+   Two options, both R0-compatible since `train/` and `labels/` are gitignored
    upstream:
    - (a) `stage` writes real dirs at the repo root where `jarvis.sh upload`
      expects them, with `unstage` to remove them.
@@ -709,9 +873,9 @@ the isolation constraint is ever lifted, these are worth upstreaming:
      and junctions under OneDrive are unreliable — likely not worth it.
    Leaning (a) with an explicit warning print, but this touches R0 (the
    controlling rule), so confirm before implementing.
-3. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
+4. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
    it is the sole optional phase.
 
-The scope is locked (D8) and no gate remains. Phases 3–4 and 6–7 need no
+The scope is locked (D8) and no gate remains. Phases 6–7 need no
 external credentials, no GPU budget, and — since D15 — no Drive credentials
 either.

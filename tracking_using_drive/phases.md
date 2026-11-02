@@ -121,7 +121,8 @@ immediately after one successful auth, or the credential bug will hide.
 This is the branch's core addition and the only way the dataset can support
 tracking at all.
 
-**Status: core complete (2026-11-01), end-to-end exit criterion pending Phase 4.**
+**Status: complete (2026-11-01).** Core delivered in Phase 3; the end-to-end
+exit criterion was measured in Phase 4 (0.0013% rate error).
 
 **Work**
 - [x] `sequence.py` — `Motion`, `Occlusion`, `GroundTruth` dataclasses.
@@ -145,7 +146,9 @@ tracking at all.
 - [x] Batch mode — `synth --count N` renders N sequences into `seq_NNN/` with an
   `index.json`. D8 says success is a *measured error bar*; one sequence yields
   one number with no spread, which cannot separate a real 8% from a lucky 8%.
-- [ ] **Tracked end-to-end recovery** — requires Phase 4's `stream.py`.
+- [x] **Tracked end-to-end recovery** — closed by Phase 4. Measured through
+  `stream.py`: recovered `[1.75779, -0.87886]` vs truth
+  `[1.75781, -0.87891]` = **0.0013%**, well inside R9's 10%.
 
 **Measured so far**
 - R9 formula agreement: worst error **0.0001%** against `estimate_trajectory`
@@ -178,7 +181,8 @@ the ground truth the tracker will be scored against.*
 alias between frames and ByteTrack will fail to associate even with correct
 synthesis. Tune `dx`/`dy` against object size before blaming the tracker.
 
-*Not yet exercised against a real tracker — open until Phase 4.*
+*Now exercised: Phase 4 drove `stream.py` over this fixture end-to-end and
+recovered the rate to 0.0013% (see Phase 4).*
 
 ---
 
@@ -192,32 +196,95 @@ directly at those centres. That validates ByteTrack → Kalman → orbit
 independently of any detector, and isolates precisely the layer this branch
 fixes. Real weights (Phase 5) are needed only for the *full* end-to-end path.
 
+**Status: core complete (2026-11-01). All exit criteria met on the Phase 3
+occlusion fixture — measured below.**
+
 **Work**
-- [ ] `stream.py` — reimplement `run_stream` importing `TrajectoryBank`,
-  `summarize_track`, `classify_crops`, `fuse`, `resolve_model`, `probe_fps`.
-- [ ] **D13 injection path** — accept a pre-computed detection stream (from
-  `sequence.py`'s ground truth) in place of `model.track()`, so the tracking
-  layer can be exercised with zero detector dependency.
-- [ ] Missed-detection propagation: `bank.miss(tid, dt=1.0/rate)` for every
-  active, unobserved, unexpired track.
-- [ ] `missed` / `expired` counters; `--max-missed` (default 30).
-- [ ] `frame_wh` captured from the **first** frame; orbit block guarded on
-  `frames > 0`. (Fixes the `stream.py:181` unbound-variable bug.)
-- [ ] `n_missed`, `lifespan_s`, `expired` in the per-track report.
-- [ ] Expired tracks excluded from the orbit report but history retained.
+- [x] `stream.py` — reimplemented `run_stream` importing `TrajectoryBank`,
+  `summarize_track`, `classify_crops`, `fuse`, `probe_fps`.
+- [x] **D13 injection path** — `run_stream(..., detections=...)` accepts a
+  pre-computed stream in place of `model.track()`. **No model is loaded and no
+  weights are needed**; frames are read straight from disk and associated by
+  `assign_track_ids()`.
+- [x] Missed-detection propagation — `engine.predict()` advances *every* active
+  track one frame each frame. **Not** the naive `bank.miss()` + `update()`
+  pairing: see the measured table in `stream.py` §Design, where the naive form
+  lands **-58.77%** on velocity at re-acquisition versus **+13.30%** for
+  predict-then-correct.
+- [x] `n_missed` / `expired` counters; `max_missed` (default 30).
+- [x] `frame_wh` captured from the **first** frame; orbit report guarded on
+  `frame_wh is not None`. *(Originally described as fixing an unbound-variable
+  crash at `stream.py:181` — **not reachable**, verified 2026-11-01: the report
+  block is guarded by `bank.ids()`, which is only truthy if the loop ran and
+  bound `width`. The real defect is that geometry came from the **last** frame,
+  which silently mis-fits mixed-size sources. See `stream.py` §Why.)*
+- [x] `n_missed`, `lifespan_s`, `expired` in the per-track report, plus a full
+  `tracks` inventory in the summary (otherwise expired tracks would be
+  invisible in every output).
+- [x] Expired tracks excluded from the orbit report but history retained — the
+  bank is never pruned, so they stay inspectable.
+- [x] Records now carry `cx`/`cy`. The original omitted them while
+  `orbit_from_jsonl` (`orbit.py:294`) reads them unconditionally, so the
+  original's own JSONL could not be replayed through the library's offline
+  orbit stage.
 
-**Exit criterion**
+**Measured on the Phase 3 occlusion fixture (30 frames, gap 10–19, injected)**
+
+| exit criterion | result |
+|---|---|
+| track ID preserved across the gap | **1** distinct id, before and after |
+| filter predicted rather than froze | `predicted_track_ids == [1]` on **all 10** gap frames; `motion` resumes at 0.032763 vs 0.032616 pre-gap |
+| appears **once** in the orbit report | `orbit_tracks = 1`, ids `[1]` |
+| `n_missed` recorded | **10** (exactly the gap) |
+| angular rate vs ground truth | `[1.75779, -0.87886]` vs `[1.75781, -0.87891]` → **0.0013%** (R9: 10%) |
+| no regression on Phase 3 | R9 still 0.0013%, well inside tolerance |
+
+**The non-vacuity check** — id survival is only meaningful if it *fails* when
+prediction fails. It does:
+
+| | distinct ids | id after gap | verdict |
+|---|---|---|---|
+| prediction working | `[1]` | 1 | preserved |
+| prediction frozen | `[1, 2]` | 2 | **splits into two fragments** |
+
+Without prediction the re-appearing object sits 67 px from where the frozen
+track waits, outside the gate (4 observed steps ≈ 27 px), gets a fresh id, and
+the track fragments into two length-10 pieces — precisely the failure mode
+this phase exists to prevent. So the exit criterion is a real assertion, not a
+constant-id tautology.
+
+**Exit criterion — MET (2026-11-01), measured on the Phase 3 fixture**
 On the occlusion fixture from Phase 3, using injected detections:
-- track ID preserved across the gap;
+- track ID preserved across the gap: **1** distinct id, before and after;
 - during the gap `motion` is non-zero and consistent with pre-gap velocity
-  (the filter **predicted**, it did not freeze);
-- the track appears **once** in the orbit report, not twice.
+  (the filter **predicted**, it did not freeze): `predicted_track_ids == [1]`
+  on all 10 gap frames, `motion` resumes at 0.032763 vs 0.032616 pre-gap;
+- the track appears **once** in the orbit report, not twice: `orbit_tracks = 1`.
 
-Plus: no regression on the Phase 3 angular-rate check.
+Plus: no regression on the Phase 3 angular-rate check — recovered
+`[1.75779, -0.87886]` vs truth `[1.75781, -0.87891]` = **0.0013%** (R9: 10%).
+
+**The `max_missed` boundary, measured both sides.** The default of 30 bridges
+the 10-frame gap; a tight budget of 3 does not, and the failure mode is a
+*split*, not an empty report:
+
+| `max_missed` | tracks | expired | orbit entries | what happened |
+|---|---|---|---|---|
+| 30 (default) | 1 | 0 | 1 | id 1 survived, `n_missed=10` |
+| 3 | **2** | 1 | 1 | track 1 expired in the gap; the object returned as **track 2** with 10 fresh obs, which is neither expired nor too short — so it still ships one orbit entry |
+
+The second row is why `test_cli_stream_honours_max_missed` asserts
+`orbit_tracks == 1`, not `0`: an expired track is excluded, but the
+re-acquired fragment is a legitimately new track. The split is exactly the
+failure mode the default avoids, and both sides are pinned so the parameter's
+effect cannot drift unnoticed.
 
 **Risk:** ByteTrack also predicts internally and may recover the ID on its own,
 disagreeing with our timing about when to resume. If IDs still fragment, raise
 `max_missed` above ByteTrack's cooldown — do not remove the Kalman prediction.
+*Not yet exercised: no real detector has run in this phase (D13 injects
+centres), so ByteTrack's own association has not been pitted against ours.
+Open until Phase 5 or 6.*
 
 **Note:** injected detections carry `class_id`/`conf` from ground truth, so
 this phase validates *association and motion*, not detection quality. Do not
