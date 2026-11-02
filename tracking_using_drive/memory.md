@@ -12,9 +12,9 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 2 — complete.** Anonymous Drive sync, allowlist, `gdrive://` resolution, CLI. |
-| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `cli.py`, `tests/test_drive.py`). |
-| Isolation verified | `git status` clean outside the folder; 14/14 library paths scoped under `_data/` |
+| Active phase | **Phase 3 — core complete.** `sequence.py` synthesis, erasure occlusion, D13 injection, `synth` CLI with batch mode. End-to-end tracking exit criterion is Phase 4's. |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `cli.py`, `tests/test_drive.py`, `tests/test_sequence.py`). |
+| Isolation verified | `git status` clean outside the folder; 68/68 tests pass, 0 skipped |
 | Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
 | Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13); Phase 2 needs no credentials (D15). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
 
@@ -268,6 +268,111 @@ Network (opt-in): live folder listing, live CSV download and header check.
 
 ---
 
+## Phase 3 Record (core complete 2026-11-01)
+
+### Delivered
+| File | Contents |
+|------|----------|
+| `sequence.py` | `Motion`, `Occlusion`, `GroundTruth`; `synthesise_sequence`, `detections_from_ground_truth` (D13), label/centre/rate helpers |
+| `cli.py` | `synth` subcommand — single sequence, occlusion flags, `--video`, `--count N` batch, `--json` |
+| `tests/test_sequence.py` | 34 tests |
+
+`sequence.py` is the branch's core addition: the dataset is 88k *independent*
+stills, so ByteTrack sees a track of length 1, nothing reaches
+`MIN_POINTS_FOR_ORBIT = 3`, and the pipeline reports an empty orbit — a system
+that "works" and answers nothing. Synthesis is what makes the tracking layer
+measurable at all (D8).
+
+### Why ground truth imports the library's maths
+`angular_rate_truth` uses `fov_vertical_deg` imported from
+`space_debris.utils.orbit` — the *same* function `estimate_trajectory` uses.
+`scripts/make_demo_video.py:73` hardcodes the small-angle approximation
+`fov * h / w` inline instead.
+
+Measured difference:
+
+| size | exact (`orbit.py`) | small-angle (`make_demo_video.py`) | rel diff |
+|------|-------|-------|-------|
+| 1920×1080 | 35.9834 | 33.7500 | **6.21%** |
+| 1280×720 | 35.9834 | 33.7500 | **6.21%** |
+| 1024×1024 | 60.0000 | 60.0000 | 0.00% |
+| 800×600 | 46.8264 | 45.0000 | 3.90% |
+
+Our stills are 1024×1024, where the two **coincide** — so a check run only
+here would be vacuous. 6.21% would silently eat most of R9's 10% budget before
+any tracking error was measured. Both behaviours are pinned rather than
+pick one: `test_vertical_fov_uses_exact_formula_not_small_angle`,
+`test_matches_make_demo_video_formula`,
+`test_deliberately_departs_from_demo_video_at_16_9`.
+
+### Occlusion is erasure (D12), verified by pixel statistics
+`make_demo_video`'s approach — translate the object off-canvas — can leave it
+detectable depending on padding. We erase the object's region (expanded by a
+margin so no anti-aliased edge survives), filled with the **median colour of
+the image border** rather than black, because a black rectangle is itself a
+detectable shape.
+
+Measured on `img000013.jpg`, 30 frames, occlusion 10–19:
+
+```
+visible  ROI: shape (756, 830, 3) std 65.34
+occluded ROI: shape (726, 830, 3) std  0.0     <- object genuinely gone
+background fill estimate: (35, 35, 35)  (border median, not black)
+step into gap : (0.005859, -0.00293)
+step out of gap: (0.005859, -0.00293)          <- motion never stopped
+D13 stream    : 111111111100000000001111111111
+```
+
+Ground-truth centres keep advancing through the gap — occlusion removes
+*pixels*, not motion, which is exactly what forces a tracker to predict
+rather than freeze (R11).
+
+### R9 formula agreement
+Truth vs `estimate_trajectory`, four motion/fps combinations: worst error
+**0.0001%** (tolerance 10%). This is agreement by construction, not an
+independent confirmation — the point is that it *would* fail if truth and
+estimate ever used different vertical-FOV formulas.
+
+### Deliberate scope translations
+Two planned items named `scripts/...` in `phases.md` cannot be built there —
+R0 puts `scripts/` out of bounds, so they were reimplemented in-package:
+
+| planned | delivered as |
+|---------|--------------|
+| `scripts/make_occlusion_video.py` | `synth --occlude-start/--occlude-end` |
+| `scripts/validate_angular_rate.py` | `test_angular_rate_truth_matches_library_estimate_within_10pct` |
+
+### Batch mode exists because D8 asks for an error bar
+`synth --count N` renders N sequences into `seq_NNN/` plus an `index.json`
+flagged `synthetic: true`. D8 defines success as a *measured error bar*, and
+one sequence gives one number with no spread — which cannot separate a real
+8% from a lucky 8%.
+
+### Gotchas found while building it
+- **G22** — the sibling-label convention is `.../images/<split>/<img>.jpg` →
+  `.../labels/<split>/<img>.txt`. Checking `image.parent.name == "images"`
+  is wrong (the parent is the *split*, e.g. `val`); it must be
+  `image.parent.parent.name`. Found because occlusion then refused for lack
+  of a bounding box.
+- **G23** — `occluded_frames` is a derived `@property`, deliberately **not**
+  serialised. The gap is stored once as the `occlusion` object so the two can
+  never disagree after a hand-edit. Consumers compute it after `load()`.
+- **G24** — `GroundTruth.load()` returns lists, not tuples, for `centres` and
+  `start_centre` (JSON has no tuple). Tests must compare accordingly.
+
+### Test results
+```
+68 passed in 26.11s        # 0 skipped
+```
+`test_config.py` 11, `test_drive.py` 19, `test_sequence.py` 34 (2 live-network
+tests in `test_drive.py` still gated by `CAPSTONE_NETWORK_TESTS=1`).
+
+Two test bugs were mine, not the code's: a fixture that copied an image but
+not its label (so discovery correctly found nothing), and asserting equality
+between a tuple and a JSON-round-tripped list.
+
+---
+
 ## JarvisLabs Training Flow (D14)
 
 The repo is already provisioned for GPU training off-box. What the branch must
@@ -414,6 +519,9 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G19 | `train.zip` in the shared folder is **2,456 bytes** — an empty/corrupt placeholder. | Cannot be used as a data source; `jarvis.sh` does not reference it either. Ignore it. |
 | G20 | `yolo_dataset/images/val` is only **542 images**, and all its stems are in **train.csv**, not `val.csv`. | The Drive `yolo_dataset` was built by `split_dataset.py` (seed 42, 90/10) from the 2,000 preprocessed images — a split of `train/`, unrelated to `val.csv`'s 22k. Never assume `images/val` corresponds to `val.csv`. |
 | G21 | **All 22,000 `val.csv` images are absent from the shared folder.** `train/`, `processed/`, and `yolo_dataset/` contain only `train.csv` stems (verified: 0 `val.csv` stems anywhere). | `val.csv` is annotation-only. It cannot be used as a synthesis pool (Q8) — there are no images behind it. Synthesis must draw from `train.csv` stems. |
+| G22 | The sibling-label convention is `.../images/<split>/<img>.jpg` → `.../labels/<split>/<img>.txt`, so the check is `image.parent.parent.name == "images"` — **not** `image.parent.name`. | The image's parent is the *split* (`val`), not `images`. Getting this wrong silently skips label discovery, and the symptom surfaces later as "occlusion requires a bounding box". |
+| G23 | `occluded_frames` on `GroundTruth` is a derived `@property` and is deliberately **not** written to JSON. | The gap is stored once as the `occlusion` object. Serialising both would let a hand-edited file make them disagree, and scoring would then use a different gap than was rendered. |
+| G24 | `GroundTruth.load()` returns **lists**, not tuples, for `centres` / `start_centre` / `bbox_norm`. | JSON has no tuple type. Tests comparing `== (0.5, 0.5)` against a loaded value fail even when the data is correct — compare with `pytest.approx` or `tuple(...)`. |
 
 ---
 
@@ -422,13 +530,15 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | # | Question | Blocks | Status |
 |---|----------|--------|--------|
 | Q4 | Observer-to-object range? | Physical speed stays `null` | OPEN — accepted as unknowable from data |
-| Q7 | Sync `yolo_dataset/` directly (already split) or rebuild from `train/` + `train.csv`? | Sync scope, runtime | OPEN |
-| Q8 | Use `val.csv` (22k images) as the pool for synthesis stills? | Evaluation design | OPEN |
+| Q7 | Sync `yolo_dataset/` directly (already split) or rebuild from `train/` + `train.csv`? | Sync scope, runtime | **ANSWERED 2026-11-01** — both, for different consumers. JarvisLabs (Phase 5) needs raw `train/` + `labels/train.csv` (`jarvis.sh:49-50` pushes those; `train_jarvis.py` rebuilds `yolo_dataset/` remotely). Phases 3–4 use `yolo_dataset/images/val` as-is: it is already split, already labelled, and fully enumerable under the G17 cap. |
+| Q8 | Use `val.csv` (22k images) as the pool for synthesis stills? | Evaluation design | **ANSWERED 2026-11-01 — NO.** All 22k `val.csv` images are absent from the shared folder (G21), so there is nothing to synthesise from. The pool is `train.csv` stems, i.e. the `yolo_dataset` stills. |
 | Q9 | JarvisLabs token available? GPU budget? | **Phase 5 only** — Phases 3/4/6/7 work via D13 without it | OPEN |
 
 Resolved: **Q1** (full layout), **Q2** (both raw and processed present),
 **Q3** (stills only — no video anywhere), **Q5** (no multi-object images),
-**Q6** (**Option A confirmed 2026-11-01** — synthetic-sequence validation).
+**Q6** (**Option A confirmed 2026-11-01** — synthetic-sequence validation),
+**Q7** (JarvisLabs takes raw `train/`; Phases 3–4 take `yolo_dataset`),
+**Q8** (**no** — `val.csv` has no images behind it).
 
 ---
 
@@ -554,17 +664,42 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - **Phase 2's JarvisLabs staging half is deliberately deferred** — it needs an
   R0 decision (see Next Actions 3), and only Phase 5 consumes it.
 
+### 2026-11-01 — Phase 3: sequence synthesis (core complete)
+- **Read `space_debris/utils/orbit.py` and `scripts/make_demo_video.py`** before
+  writing anything, which surfaced the FOV-formula divergence (see Phase 3
+  Record) and turned it into three pinned tests rather than a silent 6.21%.
+- **Wrote `sequence.py`** — `Motion`/`Occlusion`/`GroundTruth`,
+  `synthesise_sequence`, `detections_from_ground_truth` (D13), label/centre/rate
+  helpers. Ground truth imports `fov_vertical_deg` from the library so truth and
+  `estimate_trajectory` cannot drift apart.
+- **Occlusion by erasure (D12)**, filled with the border median rather than
+  black. Verified by pixel statistics: erased ROI std **0.0** vs visible
+  **65.34**; motion step identical across the gap; D13 stream
+  `111111111100000000001111111111`.
+- **R9 formula agreement measured: 0.0001%** worst error (tolerance 10%).
+- **Added the `synth` CLI subcommand** — single sequence, occlusion flags,
+  `--video`, `--json`, and `--count N` batch mode with `index.json`.
+- **Re-scoped two planned `scripts/...` deliverables into the package.** R0 puts
+  `scripts/` out of bounds, so `make_occlusion_video.py` became the
+  `--occlude-*` flags and `validate_angular_rate.py` became a test. Recorded in
+  `phases.md` so the plan and the code agree.
+- **68/68 tests pass, 0 skipped** (`test_config` 11, `test_drive` 19,
+  `test_sequence` 34).
+- Three mistakes were mine and are now fixed: an `import os` left unused; a
+  label-discovery check testing the wrong directory level (G22); and two test
+  assertions written against the wrong types (a fixture that copied an image but
+  not its label; a tuple compared to a JSON-round-tripped list).
+
 ---
 
 ## Next Actions
 
-1. **Phase 3 — sequence synthesis.** `sequence.py`: `Motion`, `Occlusion`,
-   `GroundTruth`, occlusion-by-erasure (D12). Unblocked and weight-free; the
-   542 cached stills are ready as input.
-2. **Phase 4 — tracking correctness.** `stream.py` reimplemented with the
-   missed-detection propagation fix and the **D13 injection path**, which
-   needs no weights.
-3. **Decide the JarvisLabs staging layout** (only matters for Phase 5). Two
+1. **Phase 4 — tracking correctness.** `stream.py` reimplemented with the
+   missed-detection propagation fix, the `frame_wh` first-frame fix,
+   `--max-missed`, and the **D13 injection path** (needs no weights). This is
+   also where Phase 3's remaining exit criterion — tracked end-to-end rate
+   recovery within 10% — gets measured.
+2. **Decide the JarvisLabs staging layout** (only matters for Phase 5). Two
    options, both R0-compatible since `train/` and `labels/` are gitignored
    upstream:
    - (a) `stage` writes real dirs at the repo root where `jarvis.sh upload`
@@ -574,7 +709,7 @@ the isolation constraint is ever lifted, these are worth upstreaming:
      and junctions under OneDrive are unreliable — likely not worth it.
    Leaning (a) with an explicit warning print, but this touches R0 (the
    controlling rule), so confirm before implementing.
-4. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
+3. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
    it is the sole optional phase.
 
 The scope is locked (D8) and no gate remains. Phases 3–4 and 6–7 need no

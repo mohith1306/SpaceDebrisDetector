@@ -176,8 +176,9 @@ that import the untouched originals where they are correct.
 | FR-5.1 | The branch MUST provide a synthesiser that turns a Drive still into an ordered sequence with known ground-truth motion. |
 | FR-5.2 | Ground truth MUST include per-frame centres, pixel shift per frame, FPS, and the implied angular rate. |
 | FR-5.3 | The synthesiser MUST generalise `scripts/make_demo_video.py` — supporting varying shift, duration, FPS, and optional occlusion gaps. |
-| FR-5.4 | An occlusion mode MUST exist (object leaves and re-enters frame) so FR-4 is testable. |
+| FR-5.4 | An occlusion mode MUST exist so FR-4 is testable. **The object is removed by erasing its region (D12), not by translating it off-canvas** — translation can leave the object detectable depending on padding, which would make FR-4 untestable in exactly the frames that matter. The ground-truth centres must keep advancing through the gap so a tracker is forced to predict rather than freeze. |
 | FR-5.5 | Any output derived from synthesised sequences MUST be labelled synthetic in the report metadata. Nothing synthetic may be presented as a measured debris orbit. |
+| FR-5.6 | The synthesiser MUST offer a batch mode producing multiple sequences, because D8 defines success as a *measured error bar* — one sequence yields a single number with no spread. |
 
 ### FR-6 — Reproducible output
 | ID | Requirement |
@@ -228,7 +229,10 @@ that import the untouched originals where they are correct.
    deliberately, to explain the defect it prevents.)
 4. `git status` outside `tracking_using_drive/` is clean after every commit.
 5. A synthesised sequence with known `dx`/`dy` yields an angular rate within
-   **10%** of ground truth.
+   **10%** of ground truth. *Met: worst case **0.0001%** across four
+   motion/fps combinations (`test_angular_rate_truth_matches_library_estimate_within_10pct`).
+   Truth and estimate share `fov_vertical_deg`, so this asserts formula
+   agreement — the property that would break first.*
 6. An occlusion-mode sequence yields **one** track with the ID preserved across
    the gap, and non-zero predicted motion during the gap.
 7. Every orbit report entry states its assumptions and its `missing` list.
@@ -250,8 +254,8 @@ that import the untouched originals where they are correct.
 
 ### New questions
 
-| # | Question | Blocks |
-|---|----------|--------|
-| Q7 | Should `yolo_dataset/` be synced directly (it is already split into `images/` + `labels/`), or rebuilt from `train/` + `labels/train.csv`? | Sync scope and runtime. |
-| Q8 | Should `val.csv` (22k images, currently unused by the codebase) be used as the pool from which synthesis stills are drawn? | Evaluation design. |
-| Q9 | Is a JarvisLabs token available, and what GPU budget is acceptable? | **Phase 5 only.** Phases 3, 4, 6, 7 complete via D13 without it. |
+| # | Question | Blocks | Status |
+|---|----------|--------|--------|
+| Q7 | Should `yolo_dataset/` be synced directly (it is already split into `images/` + `labels/`), or rebuilt from `train/` + `labels/train.csv`? | Sync scope and runtime. | **RESOLVED** — both, for different consumers. JarvisLabs (Phase 5) takes raw `train/` + `labels/train.csv`; Phases 3–4 take `yolo_dataset/images/val` as-is. |
+| Q8 | Should `val.csv` (22k images, currently unused by the codebase) be used as the pool from which synthesis stills are drawn? | Evaluation design. | **RESOLVED — no.** All 22k `val.csv` images are absent from the shared folder (G21); there is nothing behind the annotations. The pool is `train.csv` stems. |
+| Q9 | Is a JarvisLabs token available, and what GPU budget is acceptable? | **Phase 5 only.** Phases 3, 4, 6, 7 complete via D13 without it. | OPEN |

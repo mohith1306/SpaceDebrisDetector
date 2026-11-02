@@ -121,26 +121,64 @@ immediately after one successful auth, or the credential bug will hide.
 This is the branch's core addition and the only way the dataset can support
 tracking at all.
 
+**Status: core complete (2026-11-01), end-to-end exit criterion pending Phase 4.**
+
 **Work**
-- [ ] `sequence.py` — `Motion`, `Occlusion`, `GroundTruth` dataclasses.
-- [ ] `synthesise_sequence()` — constant, accelerating, curved motion.
-- [ ] **Occlusion by erasure**, not off-canvas translation. Guarantee a true
-  detection dropout.
-- [ ] Emit `ground_truth.json` with per-frame centres, pixel shift, FPS, and
+- [x] `sequence.py` — `Motion`, `Occlusion`, `GroundTruth` dataclasses.
+- [x] `synthesise_sequence()` — linear and accelerating motion.
+  (`orbit_arc` is accepted but **deliberately degrades to linear**, pinned by
+  `test_orbit_arc_degrades_to_linear_rather_than_unvalidated` — a curved path
+  we do not actually render must not take an untested branch.)
+- [x] **Occlusion by erasure**, not off-canvas translation. Verified: the
+  erased ROI's pixel std is exactly **0.0** against a visible std of 65.34
+  (D12, `test_erasure_flattens_the_object_region`).
+- [x] Emit `ground_truth.json` with per-frame centres, pixel shift, FPS, and
   implied angular rate.
-- [ ] `synthetic: true` on every artifact (R7).
-- [ ] `scripts/make_occlusion_video.py` — the occlusion test fixture.
-- [ ] `scripts/validate_angular_rate.py` — estimated vs. ground truth, < 10%.
-- [ ] Batch mode over multiple Drive stills.
+- [x] `synthetic: true` on every artifact (R7) — forced in `to_dict()`, so it
+  cannot be serialised away even if constructed with `False`.
+- [x] **Occlusion fixture** — delivered as the `synth --occlude-start/--occlude-end`
+  flags rather than `scripts/make_occlusion_video.py`. That path is out of
+  bounds (R0); the fixture belongs in this package.
+- [x] **Angular-rate validation** — delivered as
+  `test_angular_rate_truth_matches_library_estimate_within_10pct` rather than
+  `scripts/validate_angular_rate.py`, for the same R0 reason.
+- [x] Batch mode — `synth --count N` renders N sequences into `seq_NNN/` with an
+  `index.json`. D8 says success is a *measured error bar*; one sequence yields
+  one number with no spread, which cannot separate a real 8% from a lucky 8%.
+- [ ] **Tracked end-to-end recovery** — requires Phase 4's `stream.py`.
+
+**Measured so far**
+- R9 formula agreement: worst error **0.0001%** against `estimate_trajectory`
+  (tolerance 10%). Truth and estimate use the *same* `fov_vertical_deg`, so
+  they agree by construction — see the caveat below.
+- Motion continues unchanged through the gap: step into and out of the occlusion
+  both `(0.005859, -0.00293)`.
+- D13 stream over a 10-frame gap: `111111111100000000001111111111`.
+
+**Caveat we deliberately did not dodge:** on 1024×1024 stills the library's
+exact `arctan` vertical-FOV formula and `make_demo_video.py:73`'s small-angle
+approximation *coincide* (60.0 = 60.0), which would make the R9 check vacuous.
+At 1920×1080 they differ by **6.21%** — enough to consume most of the 10%
+budget before any tracking error is measured. We import the library's formula
+and pin both behaviours:
+`test_vertical_fov_uses_exact_formula_not_small_angle`,
+`test_matches_make_demo_video_formula`,
+`test_deliberately_departs_from_demo_video_at_16_9`.
 
 **Exit criterion**
 A sequence synthesised from a real Drive still is tracked end-to-end and the
 recovered angular rate is within 10% of `ground_truth.json`. The occlusion
 fixture produces a genuine detection gap (verified by inspecting the frames).
 
+*The occlusion half is met (std 0.0, gap visible in the frames). The
+"tracked end-to-end" half is Phase 4's exit criterion — this phase stops at
+the ground truth the tracker will be scored against.*
+
 **Risk:** if the object is small relative to the translation step, it may
 alias between frames and ByteTrack will fail to associate even with correct
 synthesis. Tune `dx`/`dy` against object size before blaming the tracker.
+
+*Not yet exercised against a real tracker — open until Phase 4.*
 
 ---
 
