@@ -136,6 +136,27 @@ class TrackState:
     consecutive_misses: int = 0
     n_missed: int = 0          # cumulative absent frames over the lifetime
     expired: bool = False
+    class_votes: dict = field(default_factory=dict)   # final_class -> count
+    debris_votes: int = 0      # observations classified as debris
+
+    @property
+    def dominant_class(self) -> str | None:
+        """Most-voted ``final_class``; ``None`` with no observations."""
+        if not self.class_votes:
+            return None
+        return max(self.class_votes.items(), key=lambda kv: kv[1])[0]
+
+    @property
+    def is_debris(self) -> bool | None:
+        """True when a majority of observations fused to a debris class.
+
+        ``None`` rather than ``False`` when nothing was observed: "we never
+        classified it" and "we classified it and it was not debris" are
+        different answers, and collapsing them would overstate the evidence.
+        """
+        if self.observations == 0:
+            return None
+        return self.debris_votes * 2 > self.observations
 
     @property
     def lifespan_s(self) -> float:
@@ -194,11 +215,18 @@ class TrackerEngine:
             advanced.append(tid)
         return advanced
 
-    def observe(self, tid: int, cx: float, cy: float, t: float) -> None:
+    def observe(self, tid: int, cx: float, cy: float, t: float,
+                *, final_class: str | None = None,
+                is_debris: bool | None = None) -> None:
         """Correct a track with this frame's measurement.
 
         ``dt=0.0`` because :meth:`predict` already advanced the filter for this
         frame; passing the elapsed time here would predict a second time.
+
+        ``final_class``/``is_debris`` are optional so the association tests can
+        drive the engine without a classifier; when given they accumulate into
+        the track's class vote, which is what lets an orbit entry say whether
+        the track it describes is debris.
         """
         if tid in self.states and self.states[tid].expired:
             return  # an expired id is not resurrected; the detection still ships
@@ -210,6 +238,10 @@ class TrackerEngine:
         state.observations += 1
         state.consecutive_misses = 0
         state.last_seen_t = t
+        if final_class is not None:
+            state.class_votes[final_class] = state.class_votes.get(final_class, 0) + 1
+        if is_debris:
+            state.debris_votes += 1
 
     def end_frame(self, observed: set[int]) -> list[int]:
         """Count an absent frame for every active track not seen this frame."""
@@ -278,17 +310,26 @@ class TrackerEngine:
                 "n_missed": s.n_missed,
                 "lifespan_s": round(s.lifespan_s, 4),
                 "expired": s.expired,
+                "final_class": s.dominant_class,
+                "is_debris": s.is_debris,
             }
             for tid, s in sorted(self.states.items())
         ]
 
     def orbit_report(self, *, width: int, height: int, fov_deg: float,
-                     range_km: float | None) -> list[dict]:
+                     range_km: float | None,
+                     synthetic: bool = False) -> list[dict]:
         """Per-track trajectory summaries, excluding expired tracks.
 
         History is retained for expired tracks (the bank is never pruned), so
         they remain inspectable — they are excluded from the *report*, not
         deleted from the run.
+
+        ``summarize_track`` carries no class information at all, so without the
+        enrichment below an orbit entry would describe a trajectory without
+        ever saying whether the object is debris — which is the question the
+        report exists to answer. ``is_debris`` stays ``None`` when nothing was
+        observed, rather than ``False``.
         """
         report = []
         for tid in sorted(self.bank.ids()):
@@ -307,6 +348,12 @@ class TrackerEngine:
                 lifespan_s=round(state.lifespan_s, 4),
                 expired=False,          # expired tracks never reach here
                 observations=state.observations,
+                final_class=state.dominant_class,
+                is_debris=state.is_debris,
+                class_votes=dict(state.class_votes),
+                # R7: the orbit report is the artifact most likely to be
+                # mistaken for a real measurement, so the flag lives here too.
+                synthetic=bool(synthetic),
             )
             report.append(entry)
         return report
@@ -590,25 +637,19 @@ def run_stream(
     predicted_log: list[int] = []
 
     def _emit(frame_idx: int, t: float, img: np.ndarray, path: str,
-              raw: list[dict], predicted: list[int]) -> None:
+              records: list[dict], predicted: list[int]) -> None:
+        """Write one JSONL event.
+
+        ``records`` are already fused (see ``_to_record``) and already carry
+        ``track_id``/``motion`` — fusing here a second time would re-run
+        ``fuse()`` on an already-fused label.
+        """
         nonlocal video_writer
         height, width = img.shape[:2]
-        records = []
-        observed: set[int] = set()
-        for det in raw:
-            record = _to_record(det)
+        for record in records:
             tid = record["track_id"]
             if tid is not None:
-                observed.add(int(tid))
-                filt = engine.bank.filters.get(int(tid))
-                if filt is not None:
-                    record["motion"] = {
-                        "vx_norm_s": round(float(filt.velocity[0]), 6),
-                        "vy_norm_s": round(float(filt.velocity[1]), 6),
-                        "speed_norm_s": round(float(filt.speed), 6),
-                    }
                 per_track_frames[int(tid)] += 1
-            records.append(record)
             class_counts[record["final_class"] or "unknown"] += 1
 
         event = {
@@ -621,6 +662,11 @@ def run_stream(
             # Present so "did it predict or freeze?" is answerable from the
             # JSONL itself rather than only from in-memory state (R12).
             "predicted_track_ids": sorted(predicted),
+            # R7: this file is derived from synthesised frames when the D13
+            # injection path ran. The flag rides on every event, not only on
+            # the end-of-run summary, because a consumer may read a single
+            # line out of a large file and never see the summary at all.
+            "synthetic": bool(injected),
         }
         if writer:
             writer.write(json.dumps(event) + "\n")
@@ -633,6 +679,40 @@ def run_stream(
                     str(annotate_path), fourcc, rate, (width, height)
                 )
             video_writer.write(_annotate(img.copy(), records))
+
+    def _observe_records(records: list[dict], t: float) -> set[int]:
+        """Fuse-then-correct: feed each detection's measurement and class to
+        its track. Returns the set of track ids seen this frame.
+
+        Fusion happens *before* the correction so the class vote accumulated
+        on the track is exactly the label that ships in the JSONL — the two
+        could not disagree by construction.
+        """
+        observed: set[int] = set()
+        for record in records:
+            tid = record.get("track_id")
+            if tid is None:
+                continue
+            observed.add(int(tid))
+            engine.observe(int(tid), float(record["cx"]), float(record["cy"]), t,
+                           final_class=record.get("final_class"),
+                           is_debris=record.get("is_debris"))
+        return observed
+
+    def _with_motion(records: list[dict]) -> list[dict]:
+        """Attach each track's post-prediction motion to its detection."""
+        for record in records:
+            tid = record.get("track_id")
+            if tid is None:
+                continue
+            filt = engine.bank.filters.get(int(tid))
+            if filt is not None:
+                record["motion"] = {
+                    "vx_norm_s": round(float(filt.velocity[0]), 6),
+                    "vy_norm_s": round(float(filt.velocity[1]), 6),
+                    "speed_norm_s": round(float(filt.speed), 6),
+                }
+        return records
 
     try:
         if injected:
@@ -647,17 +727,16 @@ def run_stream(
                 predicted = engine.predict()
                 assign_track_ids(frame_dets, engine, img.shape[1], img.shape[0])
                 t = frames / rate
-                for det in frame_dets:
-                    tid = det.get("track_id")
-                    if tid is not None:
-                        engine.observe(int(tid), float(det["cx"]),
-                                       float(det["cy"]), t)
-                observed = {int(d["track_id"]) for d in frame_dets
-                            if d.get("track_id") is not None}
+                records = [_to_record(d) for d in frame_dets]
+                observed = _observe_records(records, t)
+                # Motion is read after the correction, as before: the shipped
+                # velocity is this frame's post-update estimate, not the
+                # pre-correction prediction.
+                _with_motion(records)
                 engine.end_frame(observed)
                 if frame_wh is None:
                     frame_wh = (img.shape[1], img.shape[0])
-                _emit(idx, t, img, path, frame_dets, predicted)
+                _emit(idx, t, img, path, records, predicted)
                 frames += 1
                 if max_frames and frames >= max_frames:
                     break
@@ -682,17 +761,13 @@ def run_stream(
 
                 predicted = engine.predict()
                 raw = _model_frame_dets(result, names, classifier)
-                for det in raw:
-                    tid = det.get("track_id")
-                    if tid is not None:
-                        engine.observe(int(tid), float(det["cx"]),
-                                       float(det["cy"]), t)
-                observed = {int(d["track_id"]) for d in raw
-                            if d.get("track_id") is not None}
+                records = [_to_record(d) for d in raw]
+                observed = _observe_records(records, t)
+                _with_motion(records)      # post-correction estimate, as above
                 engine.end_frame(observed)
 
                 path = getattr(result, "path", None) or str(src)
-                _emit(frames, t, img, path, raw, predicted)
+                _emit(frames, t, img, path, records, predicted)
                 frames += 1
                 if max_frames and frames >= max_frames:
                     break

@@ -29,6 +29,7 @@ roadmap (see tracking_using_drive/phases.md):
   stream        detect + track, with missed-detection fix    [Phase 4 - now]
   orbit         offline orbit report from a track JSONL      [Phase 4 - now]
   track         detect + track (library stage, unmodified)   [Phase 4 - now]
+  validate      full chain end-to-end + R7/R9 audit          [Phase 6 - now]
 """
 
 
@@ -528,6 +529,94 @@ def _cmd_track(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_validate(args: argparse.Namespace) -> int:
+    """Run the full Phase 6 chain and audit the result (D13, no weights).
+
+    Drive -> sync -> synthesise -> inject -> associate -> Kalman -> orbit,
+    then compare against the degenerate baseline and sweep the FOV/range
+    assumptions. Writes ``validation_report.json`` flagged ``synthetic: true``
+    (R7) and exits non-zero if the acceptance criteria fail, so it can gate a
+    commit rather than merely print numbers.
+    """
+    from .drive import DriveError
+    from .source import resolve_source
+    from .validate import audit_synthetic_flags, run_validation
+
+    if args.image is None:
+        # Warm the cache first so the chain has a real Drive still to use.
+        try:
+            resolve_source(None, no_sync=False)
+        except (DriveError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        report = run_validation(
+            args.out, frames=args.frames, fps=args.fps,
+            occlusion=(args.occlude_start, args.occlude_end),
+            max_missed=args.max_missed, still=args.image,
+            no_sync=args.no_sync,
+        )
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    violations = audit_synthetic_flags(report)
+    rate = report["rate_recovery"]
+    continuity = report["continuity"]
+    sweep = report["sweep"]
+
+    checks = [
+        ("R7 synthetic flags", not violations),
+        ("R9 rate within 10%", rate["within_tolerance"]),
+        ("continuity improved", continuity["improved"]),
+        ("missing range reason recorded", sweep["all_missing_range_reason"]),
+        ("speed null without range", sweep["all_speed_null_without_range"]),
+        ("speed linear in range", sweep["speed_linear_in_range"]),
+        ("rate linear in fov", sweep["rate_linear_in_fov"]),
+    ]
+    failed = [name for name, ok in checks if not ok]
+
+    if args.json:
+        payload = dict(report)
+        payload["checks"] = [{"name": n, "ok": ok} for n, ok in checks]
+        payload["passed"] = not failed
+        print(json.dumps(payload, indent=2))
+        return 1 if failed else 0
+
+    print("Validation (SYNTHETIC — a validation instrument, never a measured "
+          "debris orbit; R7)")
+    print(f"  report          {report['artifacts'].get('report')}")
+    print(f"  chain           {' -> '.join(report['chain'])}")
+    print(f"  frames          {report['frames']} @ {report['fps']} fps "
+          f"(occlusion {report['occlusion']})")
+    print(f"  rate recovered  {rate['recovered_deg_s']} vs truth "
+          f"{rate['truth_deg_s']}")
+    print(f"  rate error      {rate['error_pct']}%  (tolerance "
+          f"{rate['tolerance_pct']}%)")
+    print("  continuity")
+    print(f"    baseline      {continuity['baseline']}")
+    print(f"    synthetic     {continuity['synthetic_sequence']}")
+    print(f"    improved      {continuity['improved']}")
+    print(f"  sweep           {len(sweep['rows'])} points "
+          f"(speed linear in range: {sweep['speed_linear_in_range']}, "
+          f"rate linear in fov: {sweep['rate_linear_in_fov']})")
+    for entry in report["orbit"]:
+        print(f"    #{entry['track_id']}: {entry['final_class']} "
+              f"is_debris={entry['is_debris']} "
+              f"obs={entry['observations']} missed={entry['n_missed']} "
+              f"speed={entry['speed_km_s']} missing={entry['missing']}")
+    if violations:
+        print("  R7 violations:")
+        for v in violations:
+            print(f"    - {v}")
+    print()
+    print(f"  checks: {len(checks) - len(failed)}/{len(checks)} passed")
+    for name in failed:
+        print(f"    FAIL {name}")
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tracking_using_drive",
@@ -698,6 +787,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_track.add_argument("--out", default=None, help="per-frame JSONL output")
     p_track.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     p_track.set_defaults(func=_cmd_track)
+
+    p_validate = sub.add_parser(
+        "validate",
+        help="Phase 6: run the full chain end-to-end and audit the result",
+    )
+    p_validate.add_argument(
+        "--out", required=True,
+        help="directory for frames, JSONL, orbit reports and the report",
+    )
+    p_validate.add_argument(
+        "--image", default=None,
+        help="source still (default: first cached Drive still; syncs if needed)",
+    )
+    p_validate.add_argument("--frames", type=int, default=30)
+    p_validate.add_argument("--fps", type=float, default=5.0)
+    p_validate.add_argument("--occlude-start", type=int, default=10)
+    p_validate.add_argument("--occlude-end", type=int, default=20)
+    p_validate.add_argument("--max-missed", type=int, default=30)
+    p_validate.add_argument("--no-sync", action="store_true",
+                            help="use the warm cache only, never the network")
+    p_validate.add_argument("--json", action="store_true",
+                            help="emit the full report as machine-readable JSON")
+    p_validate.set_defaults(func=_cmd_validate)
 
     return parser
 
