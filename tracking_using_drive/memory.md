@@ -12,11 +12,11 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 4 — complete.** `stream.py` predict-then-correct engine, D13 injection, `stream`/`orbit`/`track` CLI. All exit criteria measured. Next: Phase 6 (end-to-end validation). |
-| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `stream.py`, `cli.py`, `tests/test_drive.py`, `tests/test_sequence.py`, `tests/test_stream.py`). |
-| Isolation verified | `git status` clean outside the folder; 112/112 tests pass, 0 skipped |
-| Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
-| Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13); Phase 2 needs no credentials (D15). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
+| Active phase | **Phases 0–4, 6, 7 complete.** Phase 6: `validate.py` + `validate` CLI, 7/7 checks, rate error 0.0051% end-to-end, 0 R7 violations. Phase 7: checklist green, 135/135 tests. Only Phase 5 (JarvisLabs training) remains — deferred to the user. |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `stream.py`, `validate.py`, `cli.py`, `main.py`, `tests/*` — five test files). |
+| Isolation verified | `git status` clean outside the folder; 135/135 tests pass, 0 skipped (`CAPSTONE_NETWORK_TESTS=1`) |
+| Baseline recorded | **Measured (Phase 6)** — 30 independent stills → 30 tracks of length 1, 0 orbit-eligible; synthesised sequence → 1 track of length 20, 1 orbit-eligible (`improved: True`) |
+| Blocking question | **None for coding.** Only Q9 (JarvisLabs token) is outstanding — PENDING USER, gates the optional Phase 5 alone. |
 
 ### Goal
 Complete the tracking of debris using the data stored in Google Drive.
@@ -642,6 +642,10 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G24 | `GroundTruth.load()` returns **lists**, not tuples, for `centres` / `start_centre` / `bbox_norm`. | JSON has no tuple type. Tests comparing `== (0.5, 0.5)` against a loaded value fail even when the data is correct — compare with `pytest.approx` or `tuple(...)`. |
 | G25 | `space_debris.config` prints `Using device: cpu` to stdout on import (see G15), which **prefixes any `--json` CLI output**. | `json.loads(stdout)` raises `JSONDecodeError: Expecting value: line 1 column 1`. In tests use `capsys`; in a subprocess slice from `txt.find('{')`. Hit twice — once in a test, once in a verification script. |
 | G26 | Injected detections carry `class_name`; model detections carry `detector_class`. | `_to_record` originally read only `detector_class`, so every injected detection fused to `None` and was counted as `unknown` — the run succeeded while reporting the wrong taxonomy. Any consumer of both paths must read both keys. |
+| G27 | `speed_km_s` scales with **both** `range_km` **and** `fov_deg`. | A linearity-in-range check pooled across FOVs reports `False` even when speed is perfectly linear — two independent factors mixed into one ratio. Check per-FOV (`_sweep` groups by `fov_deg`). Hit once: the first `speed_linear_in_range` came back `False` on a correct pipeline. |
+| G28 | The CLI default occlusion gap is `(10, 20)`, so any run with `--frames < 20` fails. | `synthesise_sequence` refuses a gap that would never close (a gap past the end tests nothing). Tests using short sequences must pass `--occlude-start/--occlude-end` that fit. |
+| G29 | `_annotate` draws rectangles with thickness 2 — the box **interior** is untouched background. | Colour assertions sampling the interior compare background against background (`30 == 30`). Sample the 2px border (`out[y:y+2, ...]`). Also: boxes of different widths can't be `np.allclose`'d — compare per-channel means. |
+| G30 | `python tracking_using_drive/main.py` runs the file with **no package context**, so `from .cli import main` raises `ImportError: attempted relative import with no known parent package`. | `rules.md` checklist step 4 requires the direct form to work. `main.py` now branches on `__package__ in (None, "")` and imports absolutely, inserting the repo root into `sys.path`. Also: PowerShell `Select-Object -First` kills the pipe and reports a bogus exit code of `-1` — redirect to `$null` when measuring `$LASTEXITCODE`. |
 
 ---
 
@@ -674,6 +678,51 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 5. `train.py:9` — remove unreachable `"yolo11"` from `VALID_ARCHITECTURES`, or
    expose it in `main.py`.
 6. `yolov8_p1p2.yaml` — reconcile the header comment with the 4-scale Detect.
+
+### Proposed `PREPROCESSING_AND_TRACKING.md` §13/§14 edits (Phase 6, not applied)
+
+The file is out of bounds (R0), so these are recorded rather than made. Both
+sections now describe a state this branch has already moved past — in
+`tracking_using_drive/`, not upstream.
+
+**§13 "Missed detections are only partially handled"** → the paragraph:
+
+> `TrajectoryBank.miss()` can predict a track forward without a measurement,
+> but the streaming loop does not yet call it for every absent track on every
+> frame.
+
+is accurate for `space_debris/models/stream.py` and **no longer true of the
+branch's own `tracking_using_drive/stream.py`**, which advances every active
+track exactly once per frame (`TrackerEngine.predict()`) before correcting the
+observed ones with `dt=0.0`. Proposed replacement text:
+
+> **Status (branch `tracking_using_drive`):** full missed-detection
+> propagation is implemented in `tracking_using_drive/stream.py`. Each frame
+> advances *every* active track exactly once, then corrects only the observed
+> ones with `dt=0.0` — pairing `miss()` with a subsequent `update()` would
+> double-count the gap (measured: −58.77% velocity error at re-acquisition
+> versus +13.30% for predict-then-correct). Tracks expire after
+> `max_missed` consecutive absent frames (default 30); expiry is terminal,
+> history is retained, and expired tracks are excluded from the orbit report
+> but remain visible in the run inventory.
+>
+> The upstream `space_debris/models/stream.py` is unchanged and still does not
+> call `miss()`.
+
+**§14 completion table** → three rows need revising:
+
+| Row | Current | Proposed |
+|---|---|---|
+| `Full missed-detection propagation` | Partially implemented | **Implemented** (`tracking_using_drive/stream.py`) |
+| `Quantitative tracking benchmark` | Not implemented | **Partially** — track-continuity proxies (mean track length, track count, fragmentation, orbit-eligible count) measured against a degenerate baseline. MOTA/IDF1 remain unavailable: no temporal identity ground truth exists in the dataset. |
+| `Temporal identity ground truth` | Not implemented | **Available synthetically** — `sequence.py` emits per-frame centres with a known identity, which is what makes R9/R11 measurable at all. Not available for real footage. |
+
+Two further rows would be *added* rather than edited:
+
+| Row | Status |
+|---|---|
+| Sequence synthesis with ground truth | Implemented (`tracking_using_drive/sequence.py`) |
+| End-to-end validation report | Implemented (`tracking_using_drive/validate.py`, `validate` CLI subcommand) |
 
 ---
 
@@ -852,30 +901,68 @@ the isolation constraint is ever lifted, these are worth upstreaming:
   count), and `requirements.md`/`design.md`/`architecture.md` still referenced
   the out-of-bounds `scripts/` deliverables.
 
+### 2026-11-03 — Phases 6 and 7: validation and closeout
+- **Wrote `validate.py`** — `run_validation()` executes the full D13 chain
+  (Drive → synthesise → inject → associate → Kalman → orbit), plus the
+  degenerate baseline (30 independent stills) and a 12-point FOV × range
+  sweep, and writes `validation_report.json` with `synthetic: true` at the
+  top level (R7).
+- **Measured through the whole chain (R9):** ground truth
+  `[1.7578125, −0.8789062]` deg/s vs recovered
+  `[1.7577852, −0.8788614]` — **0.0051% error**, tolerance 10%.
+- **Continuity vs baseline:** baseline `tracks=30, mean_len=1,
+  orbit_eligible=0` → ours `tracks=1, mean_len=20, orbit_eligible=1`;
+  `improved: True`, deltas `+19 / −29 / +1`. The baseline reproduces the
+  Phase 0 finding on demand.
+- **Sweep facts pinned:** `speed_km_s = 0.0343 × range_km` (linear, checked
+  *per-FOV* after the pooled check gave a false negative — G27);
+  `angular_rate / fov = 0.029296` constant; no range ⇒ `speed: null` +
+  `missing: [range_km_needed_for_physical_speed]`, never an invented number.
+- **Found and fixed a real reporting gap**: `summarize_track` carried no
+  class information, so orbit entries never said whether the object is
+  debris. Orbit entries and inventory now emit `final_class`, `is_debris`,
+  `class_votes`; class fusion was restructured to run **once before
+  `observe()`** so a track's vote cannot disagree with the JSONL.
+- **`validate` CLI subcommand** — 7 checks (R7 flags, R9 < 10%, continuity
+  improved, missing-range reason, speed null, speed linear, rate linear);
+  exits non-zero on any failure so R7/R9 gate a run instead of being
+  comments. Measured: **7/7 passed, exit 0**.
+- **`test_validate.py` — 23 tests.** Two of my own test bugs found and fixed:
+  sampled the box interior instead of the 2px border (G29), and CLI tests
+  used the default gap `(10,20)` which can't close in 8–12 frames (G28).
+- **Phase 7 checklist:** all 5 steps green. Step 4 exposed that
+  `python tracking_using_drive/main.py` crashed on relative import —
+  `main.py` now bootstraps via `__package__` (G30); direct and `-m`
+  invocation both exit 0.
+- **Test-file reconciliation recorded in `phases.md`**: the plan's three
+  names (`test_source.py`, `test_sequence.py`, `test_missed_detections.py`)
+  map onto the built five — `source.py` branches live in `test_drive.py`
+  (6 tests), missed detections in `test_stream.py` (15), sequence as planned.
+  No coverage missing; no rename churn.
+- **Full suite: 135 passed, 0 skipped** (config 11, drive 19, sequence 38,
+  stream 44, validate 23) with `CAPSTONE_NETWORK_TESTS=1`.
+- **`requirements.md` §8 closed:** Q7/Q8 RESOLVED, Q4 OPEN by design,
+  Q9 PENDING USER (Phase 5 only). All 8 acceptance criteria in §7 marked
+  with evidence in `phases.md`.
+- **`memory.md` §13/§14 upstream proposal** recorded under "Proposed
+  Upstream Changes" — the file itself is out of bounds (R0).
+
 ---
 
 ## Next Actions
 
-1. **Phase 6 — end-to-end validation.** The chain already smoke-tested
-   (`synth → stream → orbit`); Phase 6 formalises it: sweep `--fov` and
-   `--range-km`, confirm `speed_km_s` stays null without a range, check
-   track-continuity metrics against the Phase 0 baseline, and verify every
-   synthetic artifact carries `synthetic: true` (R7).
-2. **Phase 7 — hardening.** Pre-commit checklist, no artifacts committed,
-   re-run Phase 0/3/4 validations, close `requirements.md` §8, final PR.
-3. **Phase 5 (optional) — JarvisLabs staging decision** when Q9 is answered.
-   Two options, both R0-compatible since `train/` and `labels/` are gitignored
-   upstream:
-   - (a) `stage` writes real dirs at the repo root where `jarvis.sh upload`
-     expects them, with `unstage` to remove them.
-   - (b) `stage` keeps the bytes in `_data/` and creates repo-root
-     **junctions**. Cleaner R0 story, but the repo lives inside **OneDrive**,
-     and junctions under OneDrive are unreliable — likely not worth it.
-   Leaning (a) with an explicit warning print, but this touches R0 (the
-   controlling rule), so confirm before implementing.
-4. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
-   it is the sole optional phase.
+1. **Phase 5 (optional, user-run) — JarvisLabs training.** Needs Q9 (a
+   JarvisLabs token) and Phase 2's raw `train/` + `labels/train.csv` staging
+   (Q7). Flow: `jl status` → `jl create L4 --storage 120` →
+   `scripts/jarvis.sh upload <id>` → `scripts/jarvis.sh train <id> --epochs 30
+   --batch 16` → fetch `best.pt` → `jl pause`. Note `train.zip` on Drive is
+   broken (G19) — upload from a local sync, not the zip. Once `best.pt`
+   exists, run the D14 half of Phase 6 (`validate` with the real detector)
+   and report it **separately** from the D13 numbers.
+2. **PR against `main`** with the phase-by-phase evidence now tabulated in
+   `phases.md` (acceptance criteria table in Phase 7, measured results in
+   Phase 6).
 
-The scope is locked (D8) and no gate remains. Phases 6–7 need no
-external credentials, no GPU budget, and — since D15 — no Drive credentials
-either.
+The scope is locked (D8) and no coding gate remains. All of Phases 0–4, 6
+and 7 are complete with measured evidence; only the optional Phase 5 needs
+external credentials (Q9) and GPU budget.

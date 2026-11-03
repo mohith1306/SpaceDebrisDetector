@@ -328,33 +328,123 @@ Phases 3, 4 and 6 all work via D13 without it.
 
 **Goal:** Prove the full chain, and document honestly what it can claim.
 
+**Status: complete (2026-11-03) via D13.** The D14 half is deferred to Phase 5
+(needs `best.pt`) — see the note at the end.
+
 **Work**
-- [ ] **Via D13:** full chain Drive → sync → synthesise → injected detections →
-  track → Kalman → orbit.
+- [x] **Via D13:** full chain Drive → sync → synthesise → injected detections →
+  track → Kalman → orbit. Delivered as `validate.py::run_validation()` plus
+  the `validate` CLI subcommand, which runs all six stages and writes
+  `validation_report.json`. The report's `chain` field records the stages
+  actually executed: `drive_sync → synthesise → inject_ground_truth →
+  associate → kalman → orbit`.
 - [ ] **Via D14 (if `best.pt` available):** repeat with the real detector so
   detection→tracking integration is covered. Report the two separately — they
-  are different claims.
-- [ ] Sweep `--fov` and `--range-km`; record how `speed_km_s` and
-  `consistent_with_circular_orbit` respond.
-- [ ] Confirm that with no `--range-km` every track reports
+  are different claims. *Deferred: needs Phase 5.*
+- [x] Sweep `--fov` and `--range-km`; record how `speed_km_s` and
+  `consistent_with_circular_orbit` respond. 12 points (3 FOVs × 4 ranges).
+- [x] Confirm that with no `--range-km` every track reports
   `missing: ["range_km_needed_for_physical_speed"]`.
-- [ ] Track-continuity metrics vs. Phase 0 baseline: mean track length, track
+- [x] Track-continuity metrics vs. Phase 0 baseline: mean track length, track
   count, fragmentation rate.
-- [ ] Verify `is_debris` populates and debris tracks are visually distinct in
+- [x] Verify `is_debris` populates and debris tracks are visually distinct in
   the annotated output.
-- [ ] **Confirm every synthetic-derived artifact carries `synthetic: true` and
+- [x] **Confirm every synthetic-derived artifact carries `synthetic: true` and
   that no report describes it as a measured orbit** (R7).
-- [ ] Update `PREPROCESSING_AND_TRACKING.md` §13/§14 — as a *proposed* upstream
+- [x] Update `PREPROCESSING_AND_TRACKING.md` §13/§14 — as a *proposed* upstream
   change recorded in `memory.md`, since the file itself is out of bounds.
 
-**Exit criterion**
-Measurable improvement in mean track length and fewer tracks for the same frame
-range. Every orbit entry states assumptions and `missing`. No synthetic result
-is presented as a measurement.
+**Measured results**
 
-**Risk:** without temporal identity ground truth there is no MOTA/IDF1. The
-available claims are track-continuity proxies on **synthetic** motion. State
-that plainly — an honest limitation beats an unsupported metric.
+*Angular rate through the whole chain (R9):*
+
+| | x (deg/s) | y (deg/s) |
+|---|---|---|
+| ground truth | 1.7578125 | -0.8789062 |
+| recovered | 1.7577852 | -0.8788614 |
+| error | **0.0051%** | **0.0051%** |
+
+Tolerance 10%; actual 0.0051%. Well inside — and sub-1% as the test now
+requires, since injected detections sit exactly on the ground-truth centres.
+
+*Track continuity vs. the degenerate baseline:*
+
+| | mean track length | tracks | orbit-eligible |
+|---|---|---|---|
+| baseline (30 independent stills) | **1.0** | **30** | **0** |
+| synthesised sequence + occlusion | **20.0** | **1** | **1** |
+| delta | **+19** | **−29** | **+1** |
+
+The baseline is genuinely degenerate — every frame is its own track and
+nothing reaches `MIN_POINTS_FOR_ORBIT = 3`, which is the Phase 0 finding
+reproduced on demand. This satisfies the exit criterion: *measurable
+improvement in mean track length and fewer tracks for the same frame range.*
+
+**The FOV/range sweep — what the numbers actually are**
+
+| fov (deg) | range (km) | speed_km_s | angular rate x |
+|---|---|---|---|
+| 45 | none | `null` | 1.3183 |
+| 45 | 200 | 5.145 | 1.3183 |
+| 60 | none | `null` | 1.7578 |
+| 60 | 800 | 27.440 | 1.7578 |
+| 90 | 5000 | 257.251 | 2.6367 |
+
+Both are **linear in their assumption**, not measurements:
+
+- `speed_km_s = 0.0343 × range_km` — 4× the range gives exactly 4× the speed.
+- `angular_rate / fov = 0.029296` — constant across all three FOVs.
+
+So `consistent_with_circular_orbit` compares a speed derived from the
+*assumed* range against Earth's ~7.9 km/s in a 10% band: it validates the
+assumption, not the observation. With no range it is `null`, speed is `null`,
+and `missing` records why. Both behaviours are pinned by tests rather than
+left to be discovered:
+
+- `test_no_range_means_no_speed_and_a_recorded_reason`
+- `test_speed_is_linear_in_the_assumed_range`
+- `test_rate_is_linear_in_the_assumed_fov`
+
+**`is_debris` — a real gap, found and fixed**
+
+`is_debris` populated correctly in the JSONL (`True`, `final_class: debris`),
+but `summarize_track` carries **no class information at all** — so an orbit
+entry described a trajectory without ever saying whether the object is debris,
+which is the question the report exists to answer. Orbit entries and the track
+inventory now carry `final_class`, `is_debris` and `class_votes`.
+
+Fusion was also restructured to happen **once, before `observe()`**, so the
+class vote accumulated on a track is exactly the label that ships in the JSONL
+— the two cannot disagree by construction.
+
+Visually distinct: `_annotate` draws debris red-dominant and non-debris
+green-dominant; `test_debris_is_visually_distinct_in_the_annotation` samples
+the rectangle *border* (the interior is untouched background) and asserts both
+the dominance and that the two differ.
+
+**R7 audit**
+
+`audit_synthetic_flags()` returns a list of violations — empty means clean.
+It is pinned to be able to *fail* (`test_audit_flags_a_report_that_claims_to_be_real`)
+by checking the top-level flag, the ground-truth flag, the claim wording, each
+orbit entry, and the presence of a limitations list. The CLI exits non-zero on
+any violation, so R7 gates a run rather than being a comment.
+
+**Exit criterion — MET**
+Measurable improvement in mean track length (+19) and fewer tracks (−29) for
+the same frame range. Every orbit entry states `assumptions` and `missing`.
+No synthetic result is presented as a measurement (0 R7 violations).
+
+**Risk — stated plainly, not dodged:** without temporal identity ground truth
+there is no MOTA/IDF1. The available claims are track-continuity proxies on
+**synthetic** motion. This is recorded in the report's `limitations` field
+rather than left implicit, and `test_report_states_its_limitations` asserts it
+is stated. An honest limitation beats an unsupported metric.
+
+**Deferred:** the D14 half (real detector → tracking integration) needs
+`best.pt` from Phase 5. When run, it must be reported **separately** from the
+D13 numbers above — they are different claims, and conflating them would be
+exactly the kind of overstatement R7 exists to prevent.
 
 ---
 
@@ -363,20 +453,51 @@ that plainly — an honest limitation beats an unsupported metric.
 **Goal:** Safe to merge, legible to the next person.
 
 **Work**
-- [ ] Full pre-commit checklist (`rules.md` Git Workflow).
-- [ ] Confirm no `gdrive_cache/`, `credentials.json`, `*.pt`, `runs/`, or
-  synthesised videos are staged.
-- [ ] Re-run Phase 0, 3, 4 validations on final code.
-- [ ] Tests: `test_source.py`, `test_sequence.py`, `test_missed_detections.py`.
-- [ ] Close out `requirements.md` §8 — Q7, Q8, Q9 answered or explicitly
-  "accepted as unknown".
-- [ ] Prune stale entries from `memory.md`; write the final state.
+- [x] Full pre-commit checklist (`rules.md` Git Workflow) — all 5 steps pass
+  (isolation CLEAN, AST hardcoded-path guard 1 passed, `import
+  tracking_using_drive` OK, `python tracking_using_drive/main.py --help`
+  exit 0, no forbidden artifacts). Step 4 required `main.py` to gain a
+  direct-execution bootstrap (`__package__` check → absolute import), since
+  `from .cli import main` crashes when the file is run directly.
+- [x] Confirm no `gdrive_cache/`, `credentials.json`, `*.pt`, `runs/`, or
+  synthesised videos are staged — working tree and `git ls-files` both clean.
+- [x] Re-run Phase 0, 3, 4 validations on final code — full suite **135
+  passed** (config 11, drive 19, sequence 38, stream 44, validate 23) with
+  `CAPSTONE_NETWORK_TESTS=1`; `validate` CLI exits 0 with 7/7 checks.
+- [x] Tests for source resolution, sequence synthesis, missed detections.
+  The plan named `test_source.py` / `test_sequence.py` /
+  `test_missed_detections.py`; the built suite covers the same ground under
+  five files rather than three, and no coverage is missing:
+  | Plan file | Actual coverage |
+  |---|---|
+  | `test_source.py` | `test_drive.py` — `test_camera_index_round_trips`, `test_local_path_passthrough`, `test_empty_directory_fails_early`, `test_still_and_video_classification`, `test_gdrive_resolution_returns_local_directory`, `test_prefix_constant_is_not_a_url_parse` (all 4 `resolve_source` branches + `is_still`/`is_video`) |
+  | `test_sequence.py` | `test_sequence.py` — 38 tests, as planned |
+  | `test_missed_detections.py` | `test_stream.py` — 15 gap/miss/expiry tests (`test_id_survives_the_gap`, `test_naive_miss_plus_update_would_corrupt_velocity`, `test_track_expires_after_max_missed_frames`, …) |
+  Renaming would churn history for no gain; the mapping is recorded here
+  instead.
+- [x] Close out `requirements.md` §8 — Q7, Q8 **RESOLVED**; Q4 stays OPEN by
+  design (unknowable from data, handled by `missing`); Q9 explicitly
+  "pending user" — it gates the optional Phase 5 only.
+- [x] Prune stale entries from `memory.md`; write the final state.
 - [ ] PR against `main`, evidence attached phase by phase.
 
 **Exit criterion**
 All 8 acceptance criteria in `requirements.md` §7 demonstrated or explicitly
 waived with a reason. `git status` clean outside the folder. `memory.md`
 reflects reality.
+
+**Acceptance criteria status (final)**
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | Fresh clone resolves Drive by ID → JSONL with non-null `track_id` | **MET** — `stream` on the synthesised sequence: 1 track, id 1, 20 observations |
+| 2 | Second run performs zero downloads | **MET** — `test_warm_cache_makes_zero_network_calls` (R10) |
+| 3 | `-k hardcoded` passes | **MET** — 1 passed |
+| 4 | `git status` clean outside the folder | **MET** — isolation check CLEAN before this commit |
+| 5 | Angular rate within 10% of ground truth | **MET** — 0.0001% (formula) / **0.0051%** end-to-end (Phase 6) |
+| 6 | Occlusion → one track, ID preserved, non-zero prediction | **MET** — Phase 4 fixtures + Phase 6 `improved: True` |
+| 7 | Orbit entries state assumptions + `missing`; synthetic never called measured | **MET** — 0 R7 violations in the audit |
+| 8 | Default path works with no args, no network | **MET** — `main.py` no-args exits 0 (help), `verify` exits 0 |
 
 ---
 
