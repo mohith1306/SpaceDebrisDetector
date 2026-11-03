@@ -72,7 +72,29 @@ def synthesise_sequence(
 **Occlusion is implemented by erasing the object region**, not by translating
 it beyond the border. Translating off-canvas leaves the object detectable in
 some frames depending on padding; erasing guarantees a true detection dropout
-and is the only reliable way to test FR-4.1.
+and is the only reliable way to test FR-4.1. The erase is filled with the
+**median colour of the image border** rather than black, because a black
+rectangle is itself a detectable shape against a non-black background.
+
+### Decision: ground truth imports the library's vertical-FOV formula
+`angular_rate_truth()` calls `fov_vertical_deg` from
+`space_debris.utils.orbit` — the same function `estimate_trajectory` uses —
+rather than reimplementing it.
+
+This matters because `scripts/make_demo_video.py:73` hardcodes the small-angle
+approximation `fov * h / w` inline. The two agree only when `w == h`:
+
+| size | exact (`orbit.py`) | small-angle | rel diff |
+|------|-------|-------|-------|
+| 1920×1080 | 35.9834 | 33.7500 | **6.21%** |
+| 1024×1024 | 60.0000 | 60.0000 | 0.00% |
+
+Our Drive stills are 1024×1024, where the formulas coincide — so a validation
+run on those alone would never detect the discrepancy, making the R9 check
+vacuous for any other aspect ratio. 6.21% would silently consume most of the
+10% tolerance before any tracking error was measured. Importing keeps truth
+and estimate in agreement by construction; the divergence is pinned explicitly
+in `test_deliberately_departs_from_demo_video_at_16_9`.
 
 ### Rejected: treating stills as a sequence
 Feeding 88k unrelated images to `stream` and calling the result tracking would
@@ -87,8 +109,17 @@ It is single-image, single fixed shift, no occlusion, no batch, and writes to
 API.
 
 ### Validation
-`scripts/validate_angular_rate.py` compares estimated vs. ground-truth rate and
-asserts < 10% error. This is acceptance criterion #5.
+`test_sequence.py::test_angular_rate_truth_matches_library_estimate_within_10pct`
+recovers the ground-truth rate with `estimate_trajectory` and asserts < 10%
+error — acceptance criterion #5. Measured worst case: **0.0001%**.
+
+It is a test rather than the originally planned `scripts/validate_angular_rate.py`
+because R0 puts `scripts/` out of bounds; a test also runs on every commit
+instead of on demand.
+
+The check is only meaningful alongside the FOV decision above: truth and
+estimate must use the *same* vertical-FOV formula, or the number being
+asserted measures a formula mismatch rather than tracking accuracy.
 
 ---
 

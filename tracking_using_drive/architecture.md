@@ -123,20 +123,25 @@ tracking_using_drive/
 ├── report.py            per-track summary JSON writer
 ├── cli.py               argument parsing + dispatch
 ├── main.py              entrypoint (python -m tracking_using_drive.main)
-├── scripts/
-│   ├── make_occlusion_video.py
-│   └── validate_angular_rate.py
 └── tests/
     ├── test_source.py
     ├── test_sequence.py
     └── test_missed_detections.py
 ```
 
+There is deliberately **no `tracking_using_drive/scripts/`**. Two Phase 3
+deliverables were originally planned as `scripts/make_occlusion_video.py` and
+`scripts/validate_angular_rate.py`, but R0 puts `scripts/` out of bounds, so
+they were reimplemented in-package as the `synth --occlude-*` flags and
+`test_sequence.py::test_angular_rate_truth_matches_library_estimate_within_10pct`
+respectively (see `phases.md` §Phase 3).
+
 Runtime entrypoint:
 ```bash
-python -m tracking_using_drive.main track --source gdrive://1vxqeBHOglilc1PP_ZSNA1fCx_jfTTdUY
-python -m tracking_using_drive.main synth --image <still> --occlusion --out runs/seq
-python -m tracking_using_drive.main stream --source runs/seq/demo.mp4 --orbit-report runs/orbit.json
+python -m tracking_using_drive.main sync
+python -m tracking_using_drive.main synth --out runs/seq --frames 30 --occlude-start 10 --occlude-end 20
+python -m tracking_using_drive.main synth --out runs/batch --count 8        # D8: a spread, not one sample
+python -m tracking_using_drive.main stream --source runs/seq/sequence.mp4 --orbit-report runs/orbit.json
 ```
 
 ---
