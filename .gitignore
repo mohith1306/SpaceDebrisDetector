@@ -11,6 +11,11 @@ gdrive_cache/
 runs/
 model_checkpoints/
 
+# Physics-motivated preprocessing experiment outputs (never commit data/images)
+processed_dataset/
+logs/*
+!logs/.gitkeep
+
 # Large raw dataset (too big for git; sync from Drive or train.zip)
 train/
 labels/

@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# Experiment configuration: 3-Channel Physics-Motivated Preprocessing
+#
+# Single source of truth for the controlled experiment. Scripts read this file
+# (preprocessing/experiment_config.py) and allow CLI flags to override.
+#
+# Baseline for comparison: the ORIGINAL preprocessing technique
+# (grayscale -> Gaussian 3x3 -> CLAHE -> Gaussian 3x3 -> min-max -> duplicated
+# grayscale into 3 channels), trained with the SAME model and training setup.
+# ---------------------------------------------------------------------------
+
+experiment_name: physics_3channel
+description: >-
+  Controlled experiment: does a 3-channel physics-motivated preprocessing
+  pipeline (percentile-normalized intensity + CLAHE + background residual)
+  improve space-debris detection over the baseline duplicated-grayscale
+  preprocessing?
+
+# --- Dataset ---------------------------------------------------------------
+# Source: Google Drive "Capstone" folder containing a pre-built YOLO dataset
+#   https://drive.google.com/drive/u/0/folders/1vxqeBHOglilc1PP_ZSNA1fCx_jfTTdUY
+# Expected layout (auto-detected by dataset_processor):
+#   <source>/yolo_dataset/images/{train,val}/*.jpg|png
+#   <source>/yolo_dataset/labels/{train,val}/*.txt
+# (or source pointing directly at the yolo_dataset directory)
+dataset:
+  source_drive_url: "https://drive.google.com/drive/u/0/folders/1vxqeBHOglilc1PP_ZSNA1fCx_jfTTdUY"
+  source_drive_folder: "Capstone"     # folder name searched via pydrive2
+  dataset_dir_name: "yolo_dataset"    # YOLO dataset folder inside the source
+  output_dir_name: "processed_dataset"  # created locally, then uploaded to Drive
+  image_extensions: [".jpg", ".jpeg", ".png"]
+
+# --- Split (experiment decision: 80/20, seed 42) ---------------------------
+# NOTE: this pools the original train/val folders and re-splits deterministically.
+# For a strictly fair baseline comparison the baseline should be retrained on
+# this same split (documented in README.md).
+split:
+  train_ratio: 0.8
+  val_ratio: 0.2
+  seed: 42
+
+# --- Preprocessing pipeline (must match preprocessing/physics_pipeline.py) --
+preprocessing:
+  percentiles: [1.0, 99.0]           # Channel 1 clipping range
+  denoise_kernel: [3, 3]             # Gaussian denoise before CLAHE
+  denoise_sigma: 0.0                 # 0 => OpenCV derives sigma from kernel
+  clahe_clip_limit: 1.5
+  clahe_tile_grid: [8, 8]
+  background_sigma: 25.0             # Channel 3 background estimate
+  residual_shift: 128                # zero-residual -> mid-grey
+  residual_blur_kernel: [3, 3]
+  jpeg_quality: 95                   # processed JPEGs
+  jpeg_subsampling: 0                # 0 = 4:4:4 (never average channels)
+
+# --- Model: EXACTLY the baseline model (do not change) ----------------------
+# Identified from train_jarvis.py defaults + phases.md:
+#   arch = p1p2 (custom yolov8_p1p2.yaml, P1/P2 heads for small objects)
+#   size = n   (YOLOv8-nano scale, trained FROM SCRATCH like the baseline)
+model:
+  arch: "p1p2"
+  model_size: "n"
+  model_yaml: "space_debris/models/yolov8_p1p2.yaml"
+  initialization: "scratch"          # baseline never used COCO weights
+
+# --- Training: baseline settings + HSV augmentation disabled ---------------
+training:
+  epochs: 30
+  imgsz: 640
+  batch: 16
+  workers: 4
+  patience: 30                       # train_resilient.py used patience=epochs
+  save_period: 1
+  project_name: "physics_detect"     # runs/physics_detect (never runs/detect)
+  max_retries: 3                     # crash-recovery attempts (JarvisLabs)
+  hsv_h: 0.0                         # HSV augmentations DISABLED: channels are
+  hsv_s: 0.0                         # engineered features, not RGB colours
+  hsv_v: 0.0
+
+# --- Evaluation: identical thresholds for baseline and physics run ---------
+evaluation:
+  conf: 0.25                         # same as predict/track defaults
+  iou: 0.5                           # same as baseline mAP@50 matching
+  imgsz: 640
+  max_f1_conf: null                  # null => use ultralytics best-F1 point
+
+# --- Google Drive upload ----------------------------------------------------
+upload:
+  enabled: true                      # processed_dataset/ pushed to Drive
+  folder_name: "processed_dataset"   # created under the Capstone folder
+  manifest_name: ".upload_manifest.json"
