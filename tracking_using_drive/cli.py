@@ -24,6 +24,7 @@ roadmap (see tracking_using_drive/phases.md):
   status        resolved paths, device, environment          [Phase 1 - now]
   verify        assert no library path escapes the package   [Phase 1 - now]
   sync          selective Google Drive sync                  [Phase 2 - now]
+  sync-api      big-folder sync via Drive API, no 5,500 cap  [Phase 5 - now]
   source        resolve a source (incl. gdrive://)           [Phase 2 - now]
   synth         still -> synthetic sequence + ground truth   [Phase 3 - now]
   stream        detect + track, with missed-detection fix    [Phase 4 - now]
@@ -151,6 +152,60 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         for name in report.truncated_folders:
             print(f"                   {name}")
         print("                   A full sync of these requires OAuth (--oauth).")
+        print("                   For the full listing use: sync-api (Drive API).")
+    return 0
+
+
+def _cmd_sync_api(args: argparse.Namespace) -> int:
+    """Sync folders the anonymous listing truncates (G17), via the Drive API.
+
+    Phase 5's requirement: ``train/`` holds 66,000 flat images, so the
+    anonymous endpoint can only ever show 5,500 of them. The official API
+    paginates without a cap; downloads stay on the anonymous endpoint by
+    default so the API quota is spent only on listings.
+    """
+    from .drive import (
+        DEFAULT_FOLDER_ID,
+        GDRIVE_CACHE_DIR,
+        DriveError,
+        TRACKING_ALLOWLIST,
+    )
+    from .drive_api import sync_paths
+
+    paths = tuple(args.path) if args.path else TRACKING_ALLOWLIST
+    try:
+        report = sync_paths(
+            paths,
+            folder_id=args.folder_id or DEFAULT_FOLDER_ID,
+            dest_root=Path(args.cache_dir) if args.cache_dir
+            else Path(GDRIVE_CACHE_DIR),
+            api_key=args.api_key,
+            workers=args.workers,
+            download_mode=args.download_mode,
+        )
+    except DriveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 1 if report["errors"] else 0
+
+    print(f"Drive sync via API ({report['download_mode']} downloads)")
+    print(f"  root           {report['folder_id']}")
+    print(f"  paths          {', '.join(report['paths'])}")
+    print(f"  files listed   {report['n_files']}")
+    print(f"  downloaded     {report['downloaded']}")
+    print(f"  already there  {report['skipped']}")
+    print(f"  bytes          {report['bytes']:,}")
+    print(f"  api list calls {report['api_list_calls']}")
+    if report["errors"]:
+        print(f"  ERRORS         {report['errors']} file(s) failed:")
+        for sample in report["error_samples"]:
+            print(f"                   {sample}")
+        print("                   Rerun the same command — existing files "
+              "are skipped, so it only fetches what is missing.")
+        return 1
     return 0
 
 
@@ -662,6 +717,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     p_sync.set_defaults(func=_cmd_sync)
+
+    p_sync_api = sub.add_parser(
+        "sync-api",
+        help="sync big folders via the Drive API — no 5,500 listing cap (G17)",
+    )
+    p_sync_api.add_argument(
+        "path", nargs="*",
+        help="folder-relative path(s) to sync; default is the tracking allowlist",
+    )
+    p_sync_api.add_argument(
+        "--api-key", default=None,
+        help="Google Drive API key (or set GDRIVE_API_KEY); needed because "
+             "the anonymous listing caps at 5,500 children per folder",
+    )
+    p_sync_api.add_argument(
+        "--folder-id", default=None,
+        help="Drive folder id (default: the shared Capstone folder)",
+    )
+    p_sync_api.add_argument(
+        "--cache-dir", default=None,
+        help="destination root (default: tracking_using_drive/_data/gdrive_cache)",
+    )
+    p_sync_api.add_argument(
+        "--workers", type=int, default=4,
+        help="concurrent downloads (default 4; the anonymous endpoint rate-limits)",
+    )
+    p_sync_api.add_argument(
+        "--download-mode", choices=("anonymous", "api"), default="anonymous",
+        help="anonymous = public endpoint, no API quota (default); "
+             "api = alt=media, consumes quota but survives IP rate limits",
+    )
+    p_sync_api.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_sync_api.set_defaults(func=_cmd_sync_api)
 
     p_source = sub.add_parser(
         "source",
