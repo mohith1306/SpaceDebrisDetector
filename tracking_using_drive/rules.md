@@ -170,7 +170,10 @@ main ─────────────────────────
 ### Pre-commit checklist
 ```
 1. git status --porcelain | grep -v "tracking_using_drive/"   → empty
-2. grep -rE "E:/Capstone" tracking_using_drive/               → empty
+2. No hardcoded absolute path in CODE: run the AST guard —
+   python -m pytest tracking_using_drive/tests/test_drive.py -q -k hardcoded
+   (A raw grep for the literal is unsatisfiable: the guard and the module
+   docstrings quote it deliberately. FR-3.1 constrains code, not prose.)
 3. python -c "import tracking_using_drive"
 4. python tracking_using_drive/main.py --help
 5. No gdrive_cache/, credentials.json, *.pt, or runs/ staged

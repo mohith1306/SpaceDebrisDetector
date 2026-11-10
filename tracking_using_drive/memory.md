@@ -12,11 +12,11 @@ the end of every work session.
 |------|-------|
 | Branch | `tracking_using_drive` (tracks `origin/tracking_using_drive`) |
 | Created | 2026-11-01 |
-| Active phase | **Phase 1 — complete.** Package skeleton, scoped bootstrap, CLI, tests. |
-| Code changes made | **Yes, all inside `tracking_using_drive/`** (Phase 1 code + planning docs). |
-| Isolation verified | `git status` clean outside the folder; 14/14 library paths scoped under `_data/` |
-| Baseline recorded | **Not yet — unblocked via D13** (injected detections, no weights needed) |
-| Blocking question | **None.** Scope locked (D8); weights blocker bypassed (D13). Only Q9 (JarvisLabs token) is outstanding, and it gates the optional Phase 5 alone. |
+| Active phase | **Phases 0–4, 6, 7 complete.** Phase 6: `validate.py` + `validate` CLI, 7/7 checks, rate error 0.0051% end-to-end, 0 R7 violations. Phase 7: checklist green, 135/135 tests. Only Phase 5 (JarvisLabs training) remains — deferred to the user. |
+| Code changes made | **Yes, all inside `tracking_using_drive/`** (`drive.py`, `source.py`, `sequence.py`, `stream.py`, `validate.py`, `cli.py`, `main.py`, `tests/*` — five test files). |
+| Isolation verified | `git status` clean outside the folder; 135/135 tests pass, 0 skipped (`CAPSTONE_NETWORK_TESTS=1`) |
+| Baseline recorded | **Measured (Phase 6)** — 30 independent stills → 30 tracks of length 1, 0 orbit-eligible; synthesised sequence → 1 track of length 20, 1 orbit-eligible (`improved: True`) |
+| Blocking question | **None for coding.** Only Q9 (JarvisLabs token) is outstanding — PENDING USER, gates the optional Phase 5 alone. |
 
 ### Goal
 Complete the tracking of debris using the data stored in Google Drive.
@@ -191,6 +191,306 @@ unscoped-import guard firing, and `cli verify` returning 0.
 
 ---
 
+## Phase 2 Record (complete 2026-11-01)
+
+### Delivered
+| File | Role |
+|------|------|
+| `drive.py` | Anonymous-first Drive access, selective allowlist sync, manifest, `DriveError`. |
+| `source.py` | `resolve_source()` with `gdrive://` support; `is_still()` / `is_video()`. |
+| `cli.py` | Added `sync` and `source` subcommands. |
+| `tests/test_drive.py` | 30 tests (2 network-marked, opt-in via `CAPSTONE_NETWORK_TESTS=1`). |
+
+### D15 — anonymous access removes the credential blocker
+The shared folder is **public**. Listing (`embeddedfolderview?id=`) and
+download (`uc?export=download&id=`) both work with no OAuth. Verified live.
+Consequence: Phases 2–4 carry **no credential dependency at all**. OAuth is
+retained only for private folders and for enumeration past the 5,500 listing
+cap (G17). This is a stronger position than the original plan, which assumed
+`credentials.json` was a hard prerequisite.
+
+### Measured facts (live, 2026-11-01)
+| Fact | Value |
+|------|-------|
+| Cold sync of the allowlist | **1,086 files, 171,915,492 bytes (~164 MB)** |
+| Warm sync | **0 network calls**, 1,086 cache hits |
+| `network_calls` accounting | exact: 4 on a 2-file cold sync (2 listings + 2 downloads) |
+| `yolo_dataset/images/val` | **542** stills, all stems in `train.csv` |
+| `train/` listing | capped at **5,500** (indices 1–19,075 of 110,000) — G17 |
+| `train.zip` | **2,456 bytes** — broken placeholder, ignore it — G19 |
+| CSV vs disk extension | CSV says `.png`, disk says `.jpg`; matched on **stem** — G18 |
+| `val.csv` images | **none exist** in the shared folder — G21 |
+
+### Q7 answered for the JarvisLabs path
+`jarvis.sh upload` pushes local `train/` + `labels/`, and `train_jarvis.py`
+sets `CAPSTONE_DIR=ROOT` then rebuilds `yolo_dataset/` **remotely**. So the
+training path needs the **raw** layout, not `yolo_dataset/`. Rebuilding from
+`train/` + `train.csv` is correct; syncing `yolo_dataset/` for training is
+not. (For Phases 3–4, `yolo_dataset/images/val` *is* the right source — 542
+stems, all resolvable against `train.csv` for bboxes.)
+
+### Q8 answered — and it overturns an assumption
+`val.csv` cannot be a synthesis pool. **All 22,000 of its images are absent**
+from the shared folder; every image present (in `train/`, `processed/`, and
+`yolo_dataset/`) has a stem in `train.csv`, none in `val.csv`. `val.csv` is
+annotation-only. Synthesis must draw from `train.csv` stems.
+
+### Two real bugs caught by the tests
+1. **Warm path never triggered.** The manifest is keyed per *file*
+   (`.../val/img000013.jpg`), but `_warm_check` looked up the allowlist entry
+   verbatim (`.../val`) — a directory prefix that is never itself a key. Every
+   warm run silently fell through to a full re-resolve. Fixed with
+   `_expand_entry()`.
+2. **Corruption was blessed permanently.** `_needs_fetch` re-downloaded only
+   when a file was *absent or zero-length*. A size mismatch passed straight
+   through, and `_write_manifest` then recorded the corrupted size — making
+   the damage permanent and invisible. Fixed to compare against the manifest's
+   recorded byte count. Caught by appending one byte to `train.csv` and
+   asserting exactly one re-download.
+
+### A rule conflict, resolved
+`rules.md` demanded `grep -rE "E:/Capstone" tracking_using_drive/` be empty.
+That is **unsatisfiable**: the guard test must contain the literal to check
+for it, and `drive.py` quotes it in a docstring to explain the defect. FR-3.1
+says the literal may not appear in *code*. Reconciled: the check is now
+AST-based (`test_no_hardcoded_drive_path`), ignoring docstrings. Updated in
+`rules.md`, `phases.md`, and `requirements.md` §8.
+
+### Test results
+```
+30 passed in 15.60s        # incl. 2 live-network tests
+```
+Offline: listing parser against recorded HTML, HTML-interstitial detection,
+`_expand_entry`, allowlist smallness, no hardcoded path in code, camera-index
+round-trip, still/video classification, empty-dir failure, warm cache zero
+calls, `--no-sync` on empty cache, unknown path, report metadata.
+Network (opt-in): live folder listing, live CSV download and header check.
+
+---
+
+## Phase 3 Record (core complete 2026-11-01)
+
+### Delivered
+| File | Contents |
+|------|----------|
+| `sequence.py` | `Motion`, `Occlusion`, `GroundTruth`; `synthesise_sequence`, `detections_from_ground_truth` (D13), label/centre/rate helpers |
+| `cli.py` | `synth` subcommand — single sequence, occlusion flags, `--video`, `--count N` batch, `--json` |
+| `tests/test_sequence.py` | 38 tests |
+
+`sequence.py` is the branch's core addition: the dataset is 88k *independent*
+stills, so ByteTrack sees a track of length 1, nothing reaches
+`MIN_POINTS_FOR_ORBIT = 3`, and the pipeline reports an empty orbit — a system
+that "works" and answers nothing. Synthesis is what makes the tracking layer
+measurable at all (D8).
+
+### Why ground truth imports the library's maths
+`angular_rate_truth` uses `fov_vertical_deg` imported from
+`space_debris.utils.orbit` — the *same* function `estimate_trajectory` uses.
+`scripts/make_demo_video.py:73` hardcodes the small-angle approximation
+`fov * h / w` inline instead.
+
+Measured difference:
+
+| size | exact (`orbit.py`) | small-angle (`make_demo_video.py`) | rel diff |
+|------|-------|-------|-------|
+| 1920×1080 | 35.9834 | 33.7500 | **6.21%** |
+| 1280×720 | 35.9834 | 33.7500 | **6.21%** |
+| 1024×1024 | 60.0000 | 60.0000 | 0.00% |
+| 800×600 | 46.8264 | 45.0000 | 3.90% |
+
+Our stills are 1024×1024, where the two **coincide** — so a check run only
+here would be vacuous. 6.21% would silently eat most of R9's 10% budget before
+any tracking error was measured. Both behaviours are pinned rather than
+pick one: `test_vertical_fov_uses_exact_formula_not_small_angle`,
+`test_matches_make_demo_video_formula`,
+`test_deliberately_departs_from_demo_video_at_16_9`.
+
+### Occlusion is erasure (D12), verified by pixel statistics
+`make_demo_video`'s approach — translate the object off-canvas — can leave it
+detectable depending on padding. We erase the object's region (expanded by a
+margin so no anti-aliased edge survives), filled with the **median colour of
+the image border** rather than black, because a black rectangle is itself a
+detectable shape.
+
+Measured on `img000013.jpg`, 30 frames, occlusion 10–19:
+
+```
+visible  ROI: shape (756, 830, 3) std 65.34
+occluded ROI: shape (726, 830, 3) std  0.0     <- object genuinely gone
+background fill estimate: (35, 35, 35)  (border median, not black)
+step into gap : (0.005859, -0.00293)
+step out of gap: (0.005859, -0.00293)          <- motion never stopped
+D13 stream    : 111111111100000000001111111111
+```
+
+Ground-truth centres keep advancing through the gap — occlusion removes
+*pixels*, not motion, which is exactly what forces a tracker to predict
+rather than freeze (R11).
+
+### R9 formula agreement
+Truth vs `estimate_trajectory`, four motion/fps combinations: worst error
+**0.0001%** (tolerance 10%). This is agreement by construction, not an
+independent confirmation — the point is that it *would* fail if truth and
+estimate ever used different vertical-FOV formulas.
+
+### Deliberate scope translations
+Two planned items named `scripts/...` in `phases.md` cannot be built there —
+R0 puts `scripts/` out of bounds, so they were reimplemented in-package:
+
+| planned | delivered as |
+|---------|--------------|
+| `scripts/make_occlusion_video.py` | `synth --occlude-start/--occlude-end` |
+| `scripts/validate_angular_rate.py` | `test_angular_rate_truth_matches_library_estimate_within_10pct` |
+
+### Batch mode exists because D8 asks for an error bar
+`synth --count N` renders N sequences into `seq_NNN/` plus an `index.json`
+flagged `synthetic: true`. D8 defines success as a *measured error bar*, and
+one sequence gives one number with no spread — which cannot separate a real
+8% from a lucky 8%.
+
+### Gotchas found while building it
+- **G22** — the sibling-label convention is `.../images/<split>/<img>.jpg` →
+  `.../labels/<split>/<img>.txt`. Checking `image.parent.name == "images"`
+  is wrong (the parent is the *split*, e.g. `val`); it must be
+  `image.parent.parent.name`. Found because occlusion then refused for lack
+  of a bounding box.
+- **G23** — `occluded_frames` is a derived `@property`, deliberately **not**
+  serialised. The gap is stored once as the `occlusion` object so the two can
+  never disagree after a hand-edit. Consumers compute it after `load()`.
+- **G24** — `GroundTruth.load()` returns lists, not tuples, for `centres` and
+  `start_centre` (JSON has no tuple). Tests must compare accordingly.
+
+### Test results
+```
+68 passed in 26.11s        # 0 skipped
+```
+`test_config.py` 11, `test_drive.py` 19, `test_sequence.py` 38 (2 live-network
+tests in `test_drive.py` still gated by `CAPSTONE_NETWORK_TESTS=1`).
+
+Two test bugs were mine, not the code's: a fixture that copied an image but
+not its label (so discovery correctly found nothing), and asserting equality
+between a tuple and a JSON-round-tripped list.
+
+---
+
+## Phase 4 Record (complete 2026-11-01)
+
+### Delivered
+| File | Contents |
+|------|----------|
+| `stream.py` | `TrackerEngine`, `assign_track_ids`, `iter_frames`, `run_stream` — the reimplemented pipeline with missed-detection propagation |
+| `cli.py` | `stream`, `orbit`, `track` subcommands added |
+| `tests/test_stream.py` | 44 tests |
+
+All four exit criteria met on the Phase 3 occlusion fixture (30 frames,
+gap 10–19, injected):
+
+| criterion | measured |
+|---|---|
+| id preserved across the gap | **1** distinct id, before and after |
+| predicted, not frozen | `predicted_track_ids == [1]` on all 10 gap frames; `motion` resumes 0.032763 vs 0.032616 pre-gap |
+| appears once in orbit report | `orbit_tracks = 1`, ids `[1]` |
+| `n_missed` recorded | **10** (exactly the gap) |
+| angular rate vs truth | `[1.75779, -0.87886]` vs `[1.75781, -0.87891]` → **0.0013%** (R9: 10%) |
+
+### The core design decision: predict-then-correct, not miss-then-update
+`ConstantVelocityFilter.update` (`orbit.py:47-60`) **predicts with `dt` and
+then corrects**, and `TrajectoryBank.update` derives `dt` from the last
+**observation** timestamp — but `miss()` does not append to history. The
+obvious implementation (call `miss()` per gap frame, then `update()` at
+re-acquisition) therefore advances the filter once per missed frame *and* once
+more for the whole gap: 10 + 11 = 21 frames of prediction for 11 elapsed.
+
+Measured consequence (10-frame gap, true velocity 0.06 units/frame):
+
+| | velocity at re-acquisition | error |
+|---|---|---|
+| naive `miss()` ×10 + `update(dt=11)` | 0.024737 | **-58.77%** |
+| `predict()` ×11 + `update(dt=0.0)` | 0.067980 | +13.30% |
+
+Note the *direction*: the naive form **deflates** velocity rather than
+inflating it — it over-predicts position (21 frames of advance for 11
+elapsed), and the position correction then drags the velocity estimate down to
+compensate. The damage lands on `motion.speed_norm_s`, exactly the field a
+"did it predict or freeze?" check reads. I wrote the opposite claim in the
+docstring first and corrected it after measuring. Pinned by
+`test_naive_miss_plus_update_would_corrupt_velocity`.
+
+So each frame advances **every** active track exactly once (`predict()`), then
+corrects only the observed ones with `dt=0.0`. That invariant — every active
+track advances exactly once per frame — is what makes the exit criterion
+answerable at all.
+
+### Non-vacuity: proving the assertion can fail
+"ID preserved across the gap" is vacuous if the id is a constant. The
+association gate is `GATE_SCALE(4.0) × observed per-frame step` (floor
+`GATE_FLOOR_PX(8.0)`), matched against each track's **predicted** position.
+With prediction working → id `[1]` preserved. With prediction frozen → the
+re-appearing object sits ~67 px away, outside the ~27 px gate, and the track
+**splits into `[1, 2]`**. So criterion 1 is a real assertion, not a tautology.
+
+### Expiry is terminal
+Tracks missing more than `max_missed` consecutive frames expire: they stop
+advancing, are never resurrected, and are excluded from the orbit report — but
+history is retained (the bank is never pruned) and they remain visible in the
+`tracks` inventory, otherwise "we dropped 3 tracks" would be unrecoverable
+from the outputs. `lifespan_s` = first→last **observation**; the missing tail
+does not extend it.
+
+The `max_missed` boundary, measured both sides:
+
+| `max_missed` | tracks | expired | orbit entries |
+|---|---|---|---|
+| 30 (default) | 1 | 0 | 1 |
+| 3 | **2** | 1 | 1 |
+
+With a tight budget the gap **splits** the object: track 1 expires, the object
+returns as track 2 with 10 fresh observations — not expired, not too short, so
+it still ships one orbit entry. `test_cli_stream_honours_max_missed` asserts
+`orbit_tracks == 1` (not `0`) for exactly this reason; the default-30 case is
+pinned alongside it so the parameter's effect cannot drift unnoticed.
+
+### Defects found in the original (all verified, not assumed)
+1. **`TrajectoryBank.miss()` is never called anywhere** — occluded objects
+   freeze, then fragment on re-acquisition, and both fragments fall below
+   `MIN_POINTS_FOR_ORBIT = 3`. Silent, no error raised.
+2. **`width`/`height` taken from the *last* frame** (`stream.py:181`) —
+   harmless for fixed-size video, wrong geometry for mixed-size stills.
+   *Correction:* `phases.md` originally called this an unbound-variable crash
+   on an empty source. **Not reachable** — the report block is guarded by
+   `bank.ids()`, which is only truthy if the loop ran and bound `width`.
+   Verified by replicating the original control flow; the real defect is
+   last-vs-first frame.
+3. **Records omit `cx`/`cy`** while `orbit_from_jsonl` (`orbit.py:294`) reads
+   them unconditionally — confirmed: the original's own JSONL raises
+   `KeyError: 'cx'` and cannot be replayed through the library's offline
+   stage. Ours replays cleanly.
+4. **`_to_record` only understood `detector_class`**, while the injected stream
+   from `sequence.py` carries `class_name` — every injected detection fused to
+   `None` and counted as `unknown`. The run "worked", it just reported the
+   wrong taxonomy. Caught by the first test run; fixed to accept both keys.
+
+### Gotchas found while building it
+- **G25** — `space_debris.config` prints `Using device: cpu` on import (already
+  G15). It prefixes `stream --json` stdout, so parsing CLI output needs
+  `capsys` in tests or `txt[txt.find('{'):]` in a subprocess. Hit twice.
+- **G26** — injected detections carry `class_name`, model detections carry
+  `detector_class`. Any consumer of both paths must read both keys.
+
+### Test results
+```
+112 passed in 37.47s        # 0 skipped
+```
+`test_config` 11, `test_drive` 19, `test_sequence` 38, `test_stream` 44
+(2 live-network tests in `test_drive.py` gated by `CAPSTONE_NETWORK_TESTS=1`).
+
+Six failures on the first run: four were test bugs of mine (wrong ground-truth
+path, empty-dir hitting a Phase 2 guard, an `n_missed` count that stops at
+expiry, an error-message regex), one was the real `class_name` fusion defect
+above, and one was the `max_missed` expectation corrected just now.
+
+---
+
 ## JarvisLabs Training Flow (D14)
 
 The repo is already provisioned for GPU training off-box. What the branch must
@@ -259,6 +559,7 @@ needs the JarvisLabs run.
 | **D12** | **2026-11-01** | **Occlusion is implemented by erasing the object region, not translating it off-canvas.** | Off-canvas translation can leave the object detectable depending on padding. Erasure guarantees a true dropout, which is the only way to test D4/FR-4.1. |
 | **D13** | **2026-11-01** | **Validate the tracking layer in isolation by injecting synthesised detections at known centres, decoupling it from the detector.** `sequence.py` already knows the exact object position per frame, so it can emit a detection stream directly. | No weights are reachable from the share. This unblocks Phases 3–5 immediately, and isolates precisely the layer this branch fixes — missed-detection propagation and track continuity. Complements D14 rather than replacing it: real weights still matter for the full detection→tracking path. |
 | **D14** | **2026-11-01** | **Training runs on JarvisLabs GPU, not locally. Local torch stays CPU-only.** | Stated by the project owner. The repo is already provisioned for this: `train_jarvis.py` (rebuild pipeline + train), `scripts/jarvis.sh` (instance lifecycle), `requirements-gpu.txt` (no torch pin — the pytorch template supplies CUDA builds). Local CPU is used only for inference and validation. |
+| **D15** | **2026-11-01** | **Phase 2 Drive access is anonymous-first; OAuth is an optional fallback, not a prerequisite.** | Verified directly: the shared `Capstone` folder is public, so listing (`embeddedfolderview`) and download (`uc?export=download`) both succeed with no credentials. This removes the `credentials.json` blocker from Phases 2–4 entirely. `GDriveSync`/OAuth is retained only for private folders and for enumeration beyond the public listing cap (G17). |
 
 ---
 
@@ -331,6 +632,20 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | G14 | `space_debris.config.verify_paths()` prints U+2713/U+2717 (`✓`/`✗`). | The Windows console default is **cp1252**, which cannot encode those glyphs — calling it raises `UnicodeEncodeError`. Use `data_presence()` from `tracking_using_drive.config`, which returns a dict and prints nothing. |
 | G15 | `space_debris.config` prints `Using device: cpu` on import. | An unavoidable library side effect (R0). It appears above our banner. Suppressed stdout could hide real warnings, so it is left visible. |
 | G16 | Running pytest from the repo root creates `.pytest_cache/` there. | Gitignored by the upstream `.gitignore`, so it is not an R0 violation — but remove it rather than let it accumulate. Run with `-p no:cacheprovider` to avoid it entirely. |
+| G17 | The public Drive listing endpoint (`embeddedfolderview`) **caps at 5,500 entries per folder** and ignores `page=`. | `train/` holds far more (CSV references indices up to 110,000) but only the first 5,500 are enumerable anonymously. A full 66k anonymous sync is therefore **impossible** — it needs OAuth. A small allowlisted slice is unaffected. |
+| G18 | `train.csv` names **`.png`**; the Drive folders hold **`.jpg`**. | Not a bug: `convert_labels.py:73` and `:80` join on `Path(csv_name).stem` and probe both extensions. Matching is by stem, so the mismatch is tolerated by design. Never "fix" it. |
+| G19 | `train.zip` in the shared folder is **2,456 bytes** — an empty/corrupt placeholder. | Cannot be used as a data source; `jarvis.sh` does not reference it either. Ignore it. |
+| G20 | `yolo_dataset/images/val` is only **542 images**, and all its stems are in **train.csv**, not `val.csv`. | The Drive `yolo_dataset` was built by `split_dataset.py` (seed 42, 90/10) from the 2,000 preprocessed images — a split of `train/`, unrelated to `val.csv`'s 22k. Never assume `images/val` corresponds to `val.csv`. |
+| G21 | **All 22,000 `val.csv` images are absent from the shared folder.** `train/`, `processed/`, and `yolo_dataset/` contain only `train.csv` stems (verified: 0 `val.csv` stems anywhere). | `val.csv` is annotation-only. It cannot be used as a synthesis pool (Q8) — there are no images behind it. Synthesis must draw from `train.csv` stems. |
+| G22 | The sibling-label convention is `.../images/<split>/<img>.jpg` → `.../labels/<split>/<img>.txt`, so the check is `image.parent.parent.name == "images"` — **not** `image.parent.name`. | The image's parent is the *split* (`val`), not `images`. Getting this wrong silently skips label discovery, and the symptom surfaces later as "occlusion requires a bounding box". |
+| G23 | `occluded_frames` on `GroundTruth` is a derived `@property` and is deliberately **not** written to JSON. | The gap is stored once as the `occlusion` object. Serialising both would let a hand-edited file make them disagree, and scoring would then use a different gap than was rendered. |
+| G24 | `GroundTruth.load()` returns **lists**, not tuples, for `centres` / `start_centre` / `bbox_norm`. | JSON has no tuple type. Tests comparing `== (0.5, 0.5)` against a loaded value fail even when the data is correct — compare with `pytest.approx` or `tuple(...)`. |
+| G25 | `space_debris.config` prints `Using device: cpu` to stdout on import (see G15), which **prefixes any `--json` CLI output**. | `json.loads(stdout)` raises `JSONDecodeError: Expecting value: line 1 column 1`. In tests use `capsys`; in a subprocess slice from `txt.find('{')`. Hit twice — once in a test, once in a verification script. |
+| G26 | Injected detections carry `class_name`; model detections carry `detector_class`. | `_to_record` originally read only `detector_class`, so every injected detection fused to `None` and was counted as `unknown` — the run succeeded while reporting the wrong taxonomy. Any consumer of both paths must read both keys. |
+| G27 | `speed_km_s` scales with **both** `range_km` **and** `fov_deg`. | A linearity-in-range check pooled across FOVs reports `False` even when speed is perfectly linear — two independent factors mixed into one ratio. Check per-FOV (`_sweep` groups by `fov_deg`). Hit once: the first `speed_linear_in_range` came back `False` on a correct pipeline. |
+| G28 | The CLI default occlusion gap is `(10, 20)`, so any run with `--frames < 20` fails. | `synthesise_sequence` refuses a gap that would never close (a gap past the end tests nothing). Tests using short sequences must pass `--occlude-start/--occlude-end` that fit. |
+| G29 | `_annotate` draws rectangles with thickness 2 — the box **interior** is untouched background. | Colour assertions sampling the interior compare background against background (`30 == 30`). Sample the 2px border (`out[y:y+2, ...]`). Also: boxes of different widths can't be `np.allclose`'d — compare per-channel means. |
+| G30 | `python tracking_using_drive/main.py` runs the file with **no package context**, so `from .cli import main` raises `ImportError: attempted relative import with no known parent package`. | `rules.md` checklist step 4 requires the direct form to work. `main.py` now branches on `__package__ in (None, "")` and imports absolutely, inserting the repo root into `sys.path`. Also: PowerShell `Select-Object -First` kills the pipe and reports a bogus exit code of `-1` — redirect to `$null` when measuring `$LASTEXITCODE`. |
 
 ---
 
@@ -339,13 +654,15 @@ proba_2, proba_3_csc, proba_3_ocs, smart_1, soho, xmm_newton
 | # | Question | Blocks | Status |
 |---|----------|--------|--------|
 | Q4 | Observer-to-object range? | Physical speed stays `null` | OPEN — accepted as unknowable from data |
-| Q7 | Sync `yolo_dataset/` directly (already split) or rebuild from `train/` + `train.csv`? | Sync scope, runtime | OPEN |
-| Q8 | Use `val.csv` (22k images) as the pool for synthesis stills? | Evaluation design | OPEN |
+| Q7 | Sync `yolo_dataset/` directly (already split) or rebuild from `train/` + `train.csv`? | Sync scope, runtime | **ANSWERED 2026-11-01** — both, for different consumers. JarvisLabs (Phase 5) needs raw `train/` + `labels/train.csv` (`jarvis.sh:49-50` pushes those; `train_jarvis.py` rebuilds `yolo_dataset/` remotely). Phases 3–4 use `yolo_dataset/images/val` as-is: it is already split, already labelled, and fully enumerable under the G17 cap. |
+| Q8 | Use `val.csv` (22k images) as the pool for synthesis stills? | Evaluation design | **ANSWERED 2026-11-01 — NO.** All 22k `val.csv` images are absent from the shared folder (G21), so there is nothing to synthesise from. The pool is `train.csv` stems, i.e. the `yolo_dataset` stills. |
 | Q9 | JarvisLabs token available? GPU budget? | **Phase 5 only** — Phases 3/4/6/7 work via D13 without it | OPEN |
 
 Resolved: **Q1** (full layout), **Q2** (both raw and processed present),
 **Q3** (stills only — no video anywhere), **Q5** (no multi-object images),
-**Q6** (**Option A confirmed 2026-11-01** — synthetic-sequence validation).
+**Q6** (**Option A confirmed 2026-11-01** — synthetic-sequence validation),
+**Q7** (JarvisLabs takes raw `train/`; Phases 3–4 take `yolo_dataset`),
+**Q8** (**no** — `val.csv` has no images behind it).
 
 ---
 
@@ -361,6 +678,51 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 5. `train.py:9` — remove unreachable `"yolo11"` from `VALID_ARCHITECTURES`, or
    expose it in `main.py`.
 6. `yolov8_p1p2.yaml` — reconcile the header comment with the 4-scale Detect.
+
+### Proposed `PREPROCESSING_AND_TRACKING.md` §13/§14 edits (Phase 6, not applied)
+
+The file is out of bounds (R0), so these are recorded rather than made. Both
+sections now describe a state this branch has already moved past — in
+`tracking_using_drive/`, not upstream.
+
+**§13 "Missed detections are only partially handled"** → the paragraph:
+
+> `TrajectoryBank.miss()` can predict a track forward without a measurement,
+> but the streaming loop does not yet call it for every absent track on every
+> frame.
+
+is accurate for `space_debris/models/stream.py` and **no longer true of the
+branch's own `tracking_using_drive/stream.py`**, which advances every active
+track exactly once per frame (`TrackerEngine.predict()`) before correcting the
+observed ones with `dt=0.0`. Proposed replacement text:
+
+> **Status (branch `tracking_using_drive`):** full missed-detection
+> propagation is implemented in `tracking_using_drive/stream.py`. Each frame
+> advances *every* active track exactly once, then corrects only the observed
+> ones with `dt=0.0` — pairing `miss()` with a subsequent `update()` would
+> double-count the gap (measured: −58.77% velocity error at re-acquisition
+> versus +13.30% for predict-then-correct). Tracks expire after
+> `max_missed` consecutive absent frames (default 30); expiry is terminal,
+> history is retained, and expired tracks are excluded from the orbit report
+> but remain visible in the run inventory.
+>
+> The upstream `space_debris/models/stream.py` is unchanged and still does not
+> call `miss()`.
+
+**§14 completion table** → three rows need revising:
+
+| Row | Current | Proposed |
+|---|---|---|
+| `Full missed-detection propagation` | Partially implemented | **Implemented** (`tracking_using_drive/stream.py`) |
+| `Quantitative tracking benchmark` | Not implemented | **Partially** — track-continuity proxies (mean track length, track count, fragmentation, orbit-eligible count) measured against a degenerate baseline. MOTA/IDF1 remain unavailable: no temporal identity ground truth exists in the dataset. |
+| `Temporal identity ground truth` | Not implemented | **Available synthetically** — `sequence.py` emits per-frame centres with a known identity, which is what makes R9/R11 measurable at all. Not available for real footage. |
+
+Two further rows would be *added* rather than edited:
+
+| Row | Status |
+|---|---|
+| Sequence synthesis with ground truth | Implemented (`tracking_using_drive/sequence.py`) |
+| End-to-end validation report | Implemented (`tracking_using_drive/validate.py`, `validate` CLI subcommand) |
 
 ---
 
@@ -411,7 +773,6 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - **No runtime code changed.**
 - **Pushed** `d1ddc75`, `d3f4604`, `4494973` to `origin/tracking_using_drive`
   on request.
-
 ### 2026-11-01 — Phase 1: package skeleton and bootstrap
 - **Wrote the Phase 1 code**, all inside `tracking_using_drive/`:
   `__init__.py`, `config.py`, `cli.py`, `main.py`, `tests/test_config.py`,
@@ -440,21 +801,168 @@ the isolation constraint is ever lifted, these are worth upstreaming:
 - `python -m tracking_using_drive.main status` reports all 14 library paths
   scoped under `tracking_using_drive/_data/`. `verify` exits 0.
 
+### 2026-11-01 — Phase 2: Drive access and local staging
+- **Pushed Phase 1** (`11b1405`) to `origin/tracking_using_drive`.
+- **Read all four Phase 2 dependencies**: `gdrive_sync.py`, `jarvis.sh`,
+  `train_jarvis.py`, root `.gitignore`, `space_debris/config.py`,
+  `rules.md`, `design.md`.
+- **D15 established: the shared folder is public.** Listing and download both
+  succeed anonymously. Probed with five scripts before writing any production
+  code — this finding removed the `credentials.json` blocker from Phases 2–4.
+- **Reconciled four data contradictions** (all recorded as G17–G21): the
+  5,500 listing cap; `.png` in CSV vs `.jpg` on disk (matched on stem, not a
+  bug); the broken 2,456-byte `train.zip`; and the absence of all 22,000
+  `val.csv` images.
+- **Wrote `drive.py`** — anonymous-first sync, allowlist, manifest, warm path,
+  transport-level network counter, `DriveError`.
+- **Wrote `source.py`** — `resolve_source()` with `gdrive://`, plus
+  `is_still()`/`is_video()` for the still-vs-sequence routing decision.
+- **Extended `cli.py`** with `sync` and `source`.
+- **Two real bugs caught by tests and fixed:**
+  1. warm path never triggered — manifest keyed per file, looked up per
+     directory prefix;
+  2. size-mismatch corruption was permanently blessed by the next manifest
+     write.
+- **Resolved an unsatisfiable rule** (raw grep for the drive-path literal)
+  by moving the check to AST and updating `rules.md`, `phases.md`,
+  `requirements.md` §8.
+- **30/30 tests pass**, including 2 live-network tests (opt-in via
+  `CAPSTONE_NETWORK_TESTS=1`).
+- Cold sync measured at **1,086 files / ~164 MB**; warm sync at **0 network
+  calls**. Both recorded above.
+- **Phase 2's JarvisLabs staging half is deliberately deferred** — it needs an
+  R0 decision (see Next Actions 3), and only Phase 5 consumes it.
+
+### 2026-11-01 — Phase 3: sequence synthesis (core complete)
+- **Read `space_debris/utils/orbit.py` and `scripts/make_demo_video.py`** before
+  writing anything, which surfaced the FOV-formula divergence (see Phase 3
+  Record) and turned it into three pinned tests rather than a silent 6.21%.
+- **Wrote `sequence.py`** — `Motion`/`Occlusion`/`GroundTruth`,
+  `synthesise_sequence`, `detections_from_ground_truth` (D13), label/centre/rate
+  helpers. Ground truth imports `fov_vertical_deg` from the library so truth and
+  `estimate_trajectory` cannot drift apart.
+- **Occlusion by erasure (D12)**, filled with the border median rather than
+  black. Verified by pixel statistics: erased ROI std **0.0** vs visible
+  **65.34**; motion step identical across the gap; D13 stream
+  `111111111100000000001111111111`.
+- **R9 formula agreement measured: 0.0001%** worst error (tolerance 10%).
+- **Added the `synth` CLI subcommand** — single sequence, occlusion flags,
+  `--video`, `--json`, and `--count N` batch mode with `index.json`.
+- **Re-scoped two planned `scripts/...` deliverables into the package.** R0 puts
+  `scripts/` out of bounds, so `make_occlusion_video.py` became the
+  `--occlude-*` flags and `validate_angular_rate.py` became a test. Recorded in
+  `phases.md` so the plan and the code agree.
+- **68/68 tests pass, 0 skipped** (`test_config` 11, `test_drive` 19,
+  `test_sequence` 38).
+- Three mistakes were mine and are now fixed: an `import os` left unused; a
+  label-discovery check testing the wrong directory level (G22); and two test
+  assertions written against the wrong types (a fixture that copied an image but
+  not its label; a tuple compared to a JSON-round-tripped list).
+
+### 2026-11-01 — Phase 4: tracking correctness
+- **Read the library first** — `models/stream.py`, `utils/orbit.py`,
+  `models/track.py`, `models/classify.py` — which surfaced the
+  predict-then-correct timing trap before any code was written. `update()`
+  predicts with `dt`; `miss()` doesn't append to history; the naive pairing
+  double-counts a gap.
+- **Measured the trap rather than trusting the reasoning.** My docstring first
+  claimed the naive form *inflates* velocity; measurement showed it **deflates**
+  it (−58.77% vs +13.30%) because over-predicted position drags velocity down
+  during correction. Corrected the docstring and pinned the number in
+  `test_naive_miss_plus_update_would_corrupt_velocity`.
+- **Wrote `stream.py`** — `TrackerEngine` (predict → observe → end_frame),
+  `assign_track_ids` (nearest-neighbour against *predicted* positions),
+  `iter_frames`, `run_stream` with the D13 `detections=` injection path.
+- **Proved the exit criterion is non-vacuous**: with prediction working the id
+  survives (`[1]`); with prediction frozen the track splits (`[1, 2]`). A
+  constant-id injection would have "passed" either way.
+- **All four Phase 4 exit criteria measured green** on the Phase 3 fixture —
+  id preserved, `predicted_track_ids == [1]` on all 10 gap frames, one orbit
+  entry, `n_missed == 10`, rate error **0.0013%**.
+- **Corrected an inherited claim**: the `stream.py:181` unbound-variable bug
+  is *not reachable* (verified by replicating the original control flow — the
+  report is guarded by `bank.ids()`). The real defect is last-frame-vs-first
+  geometry. `phases.md` and the docstring now say so.
+- **Found a real defect in my own code**: `_to_record` read only
+  `detector_class` while injected detections carry `class_name`, so every
+  injected detection fused to `None` and counted as `unknown` (G26).
+- **Added `stream`/`orbit`/`track` CLI subcommands**; smoke chain
+  `synth → stream --ground-truth → orbit` exits 0, and the library's
+  `orbit_from_jsonl` replays our JSONL (the original's raises `KeyError: 'cx'`,
+  confirmed by direct experiment).
+- **The `max_missed` split**: `--max-missed 3` over a 10-frame gap yields
+  `tracks == 2, expired == 1, orbit_tracks == 1` — track 1 expires, the object
+  returns as track 2. Corrected my test's wrong expectation (`orbit_tracks == 0`)
+  and pinned the contrasting `--max-missed 30` case alongside it.
+- **112/112 tests pass, 0 skipped** (`test_config` 11, `test_drive` 19,
+  `test_sequence` 38, `test_stream` 44).
+- Doc corrections made in the same pass: `test_sequence` count was recorded as
+  34 in four places (it is 38 — the batch tests were added after the first
+  count), and `requirements.md`/`design.md`/`architecture.md` still referenced
+  the out-of-bounds `scripts/` deliverables.
+
+### 2026-11-03 — Phases 6 and 7: validation and closeout
+- **Wrote `validate.py`** — `run_validation()` executes the full D13 chain
+  (Drive → synthesise → inject → associate → Kalman → orbit), plus the
+  degenerate baseline (30 independent stills) and a 12-point FOV × range
+  sweep, and writes `validation_report.json` with `synthetic: true` at the
+  top level (R7).
+- **Measured through the whole chain (R9):** ground truth
+  `[1.7578125, −0.8789062]` deg/s vs recovered
+  `[1.7577852, −0.8788614]` — **0.0051% error**, tolerance 10%.
+- **Continuity vs baseline:** baseline `tracks=30, mean_len=1,
+  orbit_eligible=0` → ours `tracks=1, mean_len=20, orbit_eligible=1`;
+  `improved: True`, deltas `+19 / −29 / +1`. The baseline reproduces the
+  Phase 0 finding on demand.
+- **Sweep facts pinned:** `speed_km_s = 0.0343 × range_km` (linear, checked
+  *per-FOV* after the pooled check gave a false negative — G27);
+  `angular_rate / fov = 0.029296` constant; no range ⇒ `speed: null` +
+  `missing: [range_km_needed_for_physical_speed]`, never an invented number.
+- **Found and fixed a real reporting gap**: `summarize_track` carried no
+  class information, so orbit entries never said whether the object is
+  debris. Orbit entries and inventory now emit `final_class`, `is_debris`,
+  `class_votes`; class fusion was restructured to run **once before
+  `observe()`** so a track's vote cannot disagree with the JSONL.
+- **`validate` CLI subcommand** — 7 checks (R7 flags, R9 < 10%, continuity
+  improved, missing-range reason, speed null, speed linear, rate linear);
+  exits non-zero on any failure so R7/R9 gate a run instead of being
+  comments. Measured: **7/7 passed, exit 0**.
+- **`test_validate.py` — 23 tests.** Two of my own test bugs found and fixed:
+  sampled the box interior instead of the 2px border (G29), and CLI tests
+  used the default gap `(10,20)` which can't close in 8–12 frames (G28).
+- **Phase 7 checklist:** all 5 steps green. Step 4 exposed that
+  `python tracking_using_drive/main.py` crashed on relative import —
+  `main.py` now bootstraps via `__package__` (G30); direct and `-m`
+  invocation both exit 0.
+- **Test-file reconciliation recorded in `phases.md`**: the plan's three
+  names (`test_source.py`, `test_sequence.py`, `test_missed_detections.py`)
+  map onto the built five — `source.py` branches live in `test_drive.py`
+  (6 tests), missed detections in `test_stream.py` (15), sequence as planned.
+  No coverage missing; no rename churn.
+- **Full suite: 135 passed, 0 skipped** (config 11, drive 19, sequence 38,
+  stream 44, validate 23) with `CAPSTONE_NETWORK_TESTS=1`.
+- **`requirements.md` §8 closed:** Q7/Q8 RESOLVED, Q4 OPEN by design,
+  Q9 PENDING USER (Phase 5 only). All 8 acceptance criteria in §7 marked
+  with evidence in `phases.md`.
+- **`memory.md` §13/§14 upstream proposal** recorded under "Proposed
+  Upstream Changes" — the file itself is out of bounds (R0).
+
 ---
 
 ## Next Actions
 
-1. **Phase 2 — Drive access and local staging.** Deterministic credentials,
-   selective sync allowlist, `gdrive://` resolution, **and** the local
-   `train/` + `labels/train.csv` layout `jarvis.sh upload` expects (G12).
-2. **Phase 3 — sequence synthesis.** Unblocked and weight-free.
-3. Resolve Q7 (which subfolder to sync) during Phase 2 design — decide between
-   syncing `yolo_dataset/` directly and rebuilding it from `train/` +
-   `train.csv`. The answer determines the sync allowlist's size.
-4. Commit and push the Phase 1 code before starting Phase 2, so the invariant
-   guards are in version control ahead of the code that depends on them.
-5. **Ask about Q9** (JarvisLabs token) only when Phase 5 is actually reached —
-   it is the sole optional phase.
+1. **Phase 5 (optional, user-run) — JarvisLabs training.** Needs Q9 (a
+   JarvisLabs token) and Phase 2's raw `train/` + `labels/train.csv` staging
+   (Q7). Flow: `jl status` → `jl create L4 --storage 120` →
+   `scripts/jarvis.sh upload <id>` → `scripts/jarvis.sh train <id> --epochs 30
+   --batch 16` → fetch `best.pt` → `jl pause`. Note `train.zip` on Drive is
+   broken (G19) — upload from a local sync, not the zip. Once `best.pt`
+   exists, run the D14 half of Phase 6 (`validate` with the real detector)
+   and report it **separately** from the D13 numbers.
+2. **PR against `main`** with the phase-by-phase evidence now tabulated in
+   `phases.md` (acceptance criteria table in Phase 7, measured results in
+   Phase 6).
 
-The scope is locked (D8) and no gate remains. Phases 2–4 and 6–7 need no
-external credentials or GPU budget.
+The scope is locked (D8) and no coding gate remains. All of Phases 0–4, 6
+and 7 are complete with measured evidence; only the optional Phase 5 needs
+external credentials (Q9) and GPU budget.
