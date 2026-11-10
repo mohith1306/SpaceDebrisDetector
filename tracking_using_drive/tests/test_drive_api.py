@@ -360,6 +360,13 @@ def test_cli_sync_api_without_key_exits_two(capsys):
 # ---------------------------------------------------------------------------
 
 
+# Measured 2026-11-10 with a live key: train/ currently holds 31,852 .jpg
+# files (stems all match train.csv — see memory.md G21). The threshold sits
+# just below that so ordinary churn doesn't fail the build, while still
+# proving pagination crossed the anonymous 5,500 cap by a factor of ~6.
+LIVE_TRAIN_MIN_FILES = 30_000
+
+
 @pytest.mark.skipif(
     not (__import__("os").environ.get("CAPSTONE_NETWORK_TESTS")
          and (__import__("os").environ.get("GDRIVE_API_KEY")
@@ -367,7 +374,12 @@ def test_cli_sync_api_without_key_exits_two(capsys):
     reason="needs CAPSTONE_NETWORK_TESTS=1 and a Drive API key",
 )
 def test_live_api_lists_the_full_train_folder(monkeypatch):
-    """The property this module exists for: train/ comes back complete."""
+    """The property this module exists for: train/ comes back complete.
+
+    The anonymous listing caps at 5,500 (G17); the API must return the whole
+    folder — today 31,852 files — or Phase 5 would train on a silent
+    fraction of the data.
+    """
     import os
 
     key = os.environ.get("GDRIVE_API_KEY") or os.environ["CAPSTONE_DRIVE_API_KEY"]
@@ -380,8 +392,11 @@ def test_live_api_lists_the_full_train_folder(monkeypatch):
     files, total_calls = drive_api.list_folder_recursive_api(
         entry.file_id, key
     )
-    assert len(files) >= 60_000, (
-        f"expected the full 66k train/ listing, got {len(files)} "
-        f"in {total_calls} API calls"
+    assert len(files) >= LIVE_TRAIN_MIN_FILES, (
+        f"expected the full train/ listing (>= {LIVE_TRAIN_MIN_FILES}), "
+        f"got {len(files)} in {total_calls} API calls"
+    )
+    assert len({f.file_id for f in files}) == len(files), (
+        "listing returned duplicate file ids — paging is broken"
     )
     assert calls >= 1
